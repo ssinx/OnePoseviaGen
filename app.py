@@ -1,6 +1,21 @@
 import os
 os.environ['TORCH_CUDA_ARCH_LIST']='9.0'
 os.environ['ATTN_BACKEND'] = 'xformers'
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+LOCAL_PACKAGE_PATHS = [
+    PROJECT_ROOT / "oneposeviagen" / "SpaTrackerV2",
+    PROJECT_ROOT / "oneposeviagen" / "SAM2-in-video",
+    PROJECT_ROOT / "oneposeviagen" / "Amodal3R",
+    PROJECT_ROOT / "oneposeviagen" / "trellis",
+    PROJECT_ROOT / "oneposeviagen" / "fpose",
+]
+for package_path in reversed(LOCAL_PACKAGE_PATHS):
+    if package_path.exists():
+        sys.path.insert(0, str(package_path))
+
 import gradio as gr
 import json
 import numpy as np
@@ -18,7 +33,6 @@ import subprocess
 import struct
 import zlib
 import matplotlib.pyplot as plt
-from pathlib import Path
 from einops import rearrange
 from typing import List, Tuple, Union
 try:
