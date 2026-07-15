@@ -439,27 +439,50 @@ def recover_true_scale(normal_model_path, anchor_depth_name, anchor_intrinsic, a
     return scaled_mesh_path, final_scale, pose
 
 
-def generate_model_and_rescale_from_workspace(models, workspace, seed=0, randomize_seed=False,
+def choose_anchor_index(mask_names):
+    if not mask_names:
+        raise ValueError("No masks available for automatic anchor selection")
+
+    best_index = 0
+    best_area = -1
+    for index, mask_path in enumerate(mask_names):
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read mask for anchor selection: {mask_path}")
+        area = int(np.count_nonzero(mask > 127))
+        if area > best_area:
+            best_index = index
+            best_area = area
+
+    print(f"🎯 Auto-selected anchor_index={best_index} with mask area={best_area}")
+    return best_index
+
+
+def generate_model_and_rescale_from_workspace(models, workspace, anchor_index=None, seed=0, randomize_seed=False,
                                               ss_guidance_strength=7.5, ss_sampling_steps=12,
                                               slat_guidance_strength=3, slat_sampling_steps=12,
                                               is_occluded=False):
     rgb_names = sorted_image_paths(os.path.join(workspace, "rgb"))
     mask_names = sorted_image_paths(os.path.join(workspace, "masks"))
     depth_names = sorted_image_paths(os.path.join(workspace, "depth"))
+    if anchor_index is None:
+        anchor_index = choose_anchor_index(mask_names)
+    if not 0 <= anchor_index < len(rgb_names):
+        raise ValueError(f"anchor_index {anchor_index} is out of range for {len(rgb_names)} frames")
     with open(os.path.join(workspace, "intrinsics.json"), "r") as f:
-        intrinsic = json.load(f)["0"]
+        intrinsic = json.load(f)[str(anchor_index)]
 
     model_dir = os.path.join(workspace, "model")
     os.makedirs(model_dir, exist_ok=True)
-    rgb_image = Image.open(rgb_names[0])
+    rgb_image = Image.open(rgb_names[anchor_index])
     if is_occluded:
-        final_mask = generate_final_mask(mask_names[0], depth_names[0])
+        final_mask = generate_final_mask(mask_names[anchor_index], depth_names[anchor_index])
     else:
-        mask = cv2.imread(mask_names[0], cv2.IMREAD_GRAYSCALE)
+        mask = cv2.imread(mask_names[anchor_index], cv2.IMREAD_GRAYSCALE)
         final_mask_np = np.ones_like(mask, dtype=np.uint8) * 255
         final_mask_np[mask > 127] = 188
         final_mask = Image.fromarray(final_mask_np)
-        rgb_image = mask_image(rgb_names[0], mask_names[0])
+        rgb_image = mask_image(rgb_names[anchor_index], mask_names[anchor_index])
     final_mask.save(os.path.join(model_dir, "final_mask.png"))
 
     actual_seed = np.random.randint(0, MAX_SEED) if randomize_seed else seed
@@ -478,10 +501,10 @@ def generate_model_and_rescale_from_workspace(models, workspace, seed=0, randomi
     )
     scaled_model_path, scale, _ = recover_true_scale(
         mesh_path,
-        depth_names[0],
+        depth_names[anchor_index],
         intrinsic,
-        rgb_names[0],
-        mask_names[0],
+        rgb_names[anchor_index],
+        mask_names[anchor_index],
         model_dir,
     )
     high_mesh = trimesh.load(high_mesh_path)
@@ -529,17 +552,20 @@ def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_
 
 
 def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE,
-                            grid_size=50, vo_points=756, mode="offline", seed=0,
+                            grid_size=50, vo_points=756, mode="offline", anchor_index=None, seed=0,
                             randomize_seed=False, ss_guidance_strength=7.5, ss_sampling_steps=12,
                             slat_guidance_strength=3, slat_sampling_steps=12, is_occluded=False):
     workspace = create_workspace(output_dir)
     prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=frame_stride, max_frames=max_frames)
+    if anchor_index is None:
+        anchor_index = choose_anchor_index(sorted_image_paths(os.path.join(workspace, "masks")))
     models = DirInferenceModels()
 
     depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode)
     model_video, scaled_model_path, high_mesh_path = generate_model_and_rescale_from_workspace(
         models,
         workspace,
+        anchor_index=anchor_index,
         seed=seed,
         randomize_seed=randomize_seed,
         ss_guidance_strength=ss_guidance_strength,
@@ -558,6 +584,7 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         "pose_video": pose_video,
         "poses_json": poses_json,
         "tracking_npz": os.path.join(workspace, "results", "result.npz"),
+        "anchor_index": anchor_index,
     }
     with open(os.path.join(workspace, "outputs.json"), "w") as f:
         json.dump(outputs, f, indent=2)
@@ -574,6 +601,7 @@ def parse_args():
     parser.add_argument("--grid-size", type=int, default=50)
     parser.add_argument("--vo-points", type=int, default=756)
     parser.add_argument("--mode", choices=["offline", "online"], default="offline")
+    parser.add_argument("--anchor-index", type=int, default=None, help="Prepared frame index used for 3D generation and scale recovery. Defaults to the mask with the largest foreground area.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--randomize-seed", action="store_true")
     parser.add_argument("--ss-guidance-strength", type=float, default=7.5)
