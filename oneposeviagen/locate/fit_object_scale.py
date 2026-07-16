@@ -16,6 +16,8 @@ from pytorch3d.renderer import (look_at_view_transform, PerspectiveCameras,
                                 PointLights, RasterizationSettings, BlendParams,
                                 MeshRenderer, MeshRasterizer, SoftPhongShader)
 from pytorch3d.io import load_objs_as_meshes
+from pytorch3d.structures import Meshes
+from pytorch3d.renderer import TexturesVertex
 
 def crop_object_with_mask(image_path, mask_path):
     # 读取原图和mask图片
@@ -148,12 +150,42 @@ def sample_camera_poses(radius, num_samples, num_up_samples=4, device='cpu'):
     # print('total poses', len(camera_poses))
     return torch.tensor(np.array(camera_poses), device=device)
 
+def load_mesh_for_rendering(mesh_path, device):
+    if str(mesh_path).lower().endswith('.obj'):
+        try:
+            mesh = load_objs_as_meshes([mesh_path], device=device)
+            if mesh.textures is not None:
+                return mesh
+        except Exception:
+            pass
+
+    loaded = trimesh.load(mesh_path, force='mesh', process=False)
+    if isinstance(loaded, trimesh.Scene):
+        geometries = [geom for geom in loaded.geometry.values() if hasattr(geom, 'vertices')]
+        if not geometries:
+            raise ValueError(f'No mesh geometry found in {mesh_path}')
+        loaded = trimesh.util.concatenate(geometries)
+
+    vertices = torch.as_tensor(np.asarray(loaded.vertices), dtype=torch.float32, device=device)
+    faces = torch.as_tensor(np.asarray(loaded.faces), dtype=torch.int64, device=device)
+
+    vertex_colors = getattr(loaded.visual, 'vertex_colors', None)
+    if vertex_colors is None or len(vertex_colors) != len(vertices):
+        colors = torch.ones((len(vertices), 3), dtype=torch.float32, device=device)
+    else:
+        colors_np = np.asarray(vertex_colors)[:, :3].astype(np.float32) / 255.0
+        colors = torch.as_tensor(colors_np, dtype=torch.float32, device=device)
+
+    textures = TexturesVertex(verts_features=[colors])
+    return Meshes(verts=[vertices], faces=[faces], textures=textures)
+
+
 def render_image(mesh, camera_poses, width=640, height=480, fov=1, device='cpu'):
     camera_poses = torch.tensor(camera_poses, device=device)
     if len(camera_poses.shape) == 2:
         camera_poses = camera_poses[None, :]
     # Render and save images from different camera poses
-    mesh = load_objs_as_meshes([mesh], device=device)
+    mesh = load_mesh_for_rendering(mesh, device=device)
     R = camera_poses[:, :3, :3]
     T = camera_poses[:, 3, :3]
     num_poses = camera_poses.shape[0]

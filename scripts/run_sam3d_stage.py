@@ -46,11 +46,13 @@ def export_sam3d_mesh(outputs, mesh_path, high_mesh_path):
         raise RuntimeError("SAM 3D did not return a mesh/glb output; cannot continue pose estimation.")
 
     if isinstance(mesh_source, trimesh.Scene):
-        mesh_source.export(mesh_path, file_type="obj")
-        mesh_source.export(high_mesh_path, file_type="obj")
-    else:
-        mesh_source.export(mesh_path)
-        mesh_source.export(high_mesh_path)
+        geometries = [geom for geom in mesh_source.geometry.values() if hasattr(geom, "vertices")]
+        if not geometries:
+            raise ValueError("SAM 3D glb scene does not contain mesh geometry.")
+        mesh_source = geometries[0] if len(geometries) == 1 else trimesh.util.concatenate(geometries)
+
+    mesh_source.export(mesh_path)
+    mesh_source.export(high_mesh_path)
 
 
 

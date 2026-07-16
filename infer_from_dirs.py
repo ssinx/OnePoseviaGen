@@ -476,7 +476,7 @@ def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomiz
         rgb_image,
         final_mask,
         workspace,
-        "obj",
+        "ply",
         actual_seed,
         ss_guidance_strength,
         ss_sampling_steps,
