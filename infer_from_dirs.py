@@ -197,7 +197,7 @@ def convert_depth_images_to_video(file_paths, output_video_path, fps=VIDEO_FPS):
     writer.release()
 
 
-def run_tracker_from_workspace(models, workspace, grid_size=50, vo_points=756, mode="offline"):
+def run_tracker_from_workspace(models, workspace, grid_size=50, vo_points=756, mode="offline", anchor_index=0):
     rgb_dir = os.path.join(workspace, "rgb")
     mask_dir = os.path.join(workspace, "masks")
     out_dir = os.path.join(workspace, "results")
@@ -223,7 +223,10 @@ def run_tracker_from_workspace(models, workspace, grid_size=50, vo_points=756, m
     intrs = intrinsic.squeeze().cpu().numpy()
     unc_metric = depth_conf.squeeze().cpu().numpy() > 0.5
 
-    mask_path = sorted_image_paths(mask_dir)[0]
+    mask_names = sorted_image_paths(mask_dir)
+    if not 0 <= anchor_index < len(mask_names):
+        raise ValueError(f"anchor_index {anchor_index} is out of range for {len(mask_names)} masks")
+    mask_path = mask_names[anchor_index]
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     mask = cv2.resize(mask, (video_tensor.shape[3], video_tensor.shape[2]), interpolation=cv2.INTER_NEAREST) > 127
 
@@ -232,8 +235,16 @@ def run_tracker_from_workspace(models, workspace, grid_size=50, vo_points=756, m
     grid_pts_int = grid_pts[0].long()
     mask_values = mask[grid_pts_int.cpu()[..., 1], grid_pts_int.cpu()[..., 0]]
     grid_pts = grid_pts[:, mask_values]
-    query_xyt = torch.cat([torch.zeros_like(grid_pts[:, :, :1]), grid_pts], dim=2)[0].cpu().numpy()
-    print(f"Query points shape: {query_xyt.shape}")
+    if grid_pts.shape[1] == 0:
+        mask_area = int(np.count_nonzero(mask))
+        raise ValueError(
+            f"No tracker query points sampled from anchor_index={anchor_index} mask "
+            f"({mask_path}, mask_area={mask_area}, grid_size={grid_size}). "
+            "Check that the anchor mask is non-empty or increase --grid-size."
+        )
+    query_t = torch.ones_like(grid_pts[:, :, :1]) * anchor_index
+    query_xyt = torch.cat([query_t, grid_pts], dim=2)[0].cpu().numpy()
+    print(f"Query points shape: {query_xyt.shape}, anchor_index={anchor_index}")
 
     with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
         (
@@ -261,6 +272,7 @@ def run_tracker_from_workspace(models, workspace, grid_size=50, vo_points=756, m
             tracks=track2d_pred[None][..., :2],
             visibility=vis_pred[None],
             filename="test",
+            query_frame=anchor_index,
         )
 
         result = {
@@ -574,7 +586,7 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         torch.cuda.empty_cache()
 
     models = DirInferenceModels()
-    depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode)
+    depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode, anchor_index=anchor_index)
     del models
     gc.collect()
     if torch.cuda.is_available():
