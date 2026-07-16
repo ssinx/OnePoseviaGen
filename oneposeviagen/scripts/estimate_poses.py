@@ -28,7 +28,10 @@ def estimate_poses(npz_path, query_image_names, query_depth_names, query_mask_na
                     mask = mask[...,c]
                     break
         mask = mask.astype(bool)
-        pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+        if frame_id == 0:
+            pose = est.register(K=K, rgb=color, depth=depth, ob_mask=mask, iteration=est_refine_iter)
+        else:
+            pose = est.track_one(K=K, rgb=color, depth=depth, iteration=est_refine_iter, extra={})
         poses.append(pose.reshape(4, 4))
 
         center_pose = pose@np.linalg.inv(to_origin)
