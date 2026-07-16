@@ -454,36 +454,25 @@ def choose_anchor_index(mask_names):
     return best_index
 
 
-def generate_model_and_rescale_from_workspace(models, workspace, anchor_index=None, seed=0, randomize_seed=False,
-                                              ss_guidance_strength=7.5, ss_sampling_steps=12,
-                                              slat_guidance_strength=3, slat_sampling_steps=12,
-                                              is_occluded=False):
+def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomize_seed=False,
+                                  ss_guidance_strength=7.5, ss_sampling_steps=12,
+                                  slat_guidance_strength=3, slat_sampling_steps=12,
+                                  is_occluded=False):
     rgb_names = sorted_image_paths(os.path.join(workspace, "rgb"))
     mask_names = sorted_image_paths(os.path.join(workspace, "masks"))
-    depth_names = sorted_image_paths(os.path.join(workspace, "depth"))
     if anchor_index is None:
         anchor_index = choose_anchor_index(mask_names)
     if not 0 <= anchor_index < len(rgb_names):
         raise ValueError(f"anchor_index {anchor_index} is out of range for {len(rgb_names)} frames")
-    with open(os.path.join(workspace, "intrinsics.json"), "r") as f:
-        intrinsic = json.load(f)[str(anchor_index)]
 
     model_dir = os.path.join(workspace, "model")
     os.makedirs(model_dir, exist_ok=True)
-    rgb_image = Image.open(rgb_names[anchor_index])
-    if is_occluded:
-        final_mask = generate_final_mask(mask_names[anchor_index], depth_names[anchor_index])
-    else:
-        mask = cv2.imread(mask_names[anchor_index], cv2.IMREAD_GRAYSCALE)
-        final_mask_np = np.ones_like(mask, dtype=np.uint8) * 255
-        final_mask_np[mask > 127] = 188
-        final_mask = Image.fromarray(final_mask_np)
-        rgb_image, final_mask = mask_image_and_mask(rgb_names[anchor_index], mask_names[anchor_index])
+    rgb_image, final_mask = mask_image_and_mask(rgb_names[anchor_index], mask_names[anchor_index])
     final_mask.save(os.path.join(model_dir, "final_mask.png"))
 
     actual_seed = np.random.randint(0, MAX_SEED) if randomize_seed else seed
-    model_video, mesh_path, high_mesh_path = generate_3d(
-        models,
+    return generate_3d(
+        None,
         rgb_image,
         final_mask,
         workspace,
@@ -495,6 +484,18 @@ def generate_model_and_rescale_from_workspace(models, workspace, anchor_index=No
         slat_sampling_steps,
         is_occluded,
     )
+
+
+def rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path):
+    rgb_names = sorted_image_paths(os.path.join(workspace, "rgb"))
+    mask_names = sorted_image_paths(os.path.join(workspace, "masks"))
+    depth_names = sorted_image_paths(os.path.join(workspace, "depth"))
+    if not 0 <= anchor_index < len(rgb_names):
+        raise ValueError(f"anchor_index {anchor_index} is out of range for {len(rgb_names)} frames")
+    with open(os.path.join(workspace, "intrinsics.json"), "r") as f:
+        intrinsic = json.load(f)[str(anchor_index)]
+
+    model_dir = os.path.join(workspace, "model")
     scaled_model_path, scale, _ = recover_true_scale(
         mesh_path,
         depth_names[anchor_index],
@@ -506,7 +507,7 @@ def generate_model_and_rescale_from_workspace(models, workspace, anchor_index=No
     high_mesh = trimesh.load(high_mesh_path)
     high_mesh.vertices = high_mesh.vertices * scale
     high_mesh.export(high_mesh_path)
-    return model_video, scaled_model_path, high_mesh_path
+    return scaled_model_path, high_mesh_path
 
 
 def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path):
@@ -555,11 +556,7 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
     prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=frame_stride, max_frames=max_frames)
     if anchor_index is None:
         anchor_index = choose_anchor_index(sorted_image_paths(os.path.join(workspace, "masks")))
-    models = DirInferenceModels()
-
-    depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode)
-    model_video, scaled_model_path, high_mesh_path = generate_model_and_rescale_from_workspace(
-        models,
+    model_video, mesh_path, high_mesh_path = generate_model_from_workspace(
         workspace,
         anchor_index=anchor_index,
         seed=seed,
@@ -570,6 +567,13 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         slat_sampling_steps=slat_sampling_steps,
         is_occluded=is_occluded,
     )
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    models = DirInferenceModels()
+    depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode)
+    scaled_model_path, high_mesh_path = rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path)
     pose_video, poses_json = estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path)
     outputs = {
         "workspace": workspace,
