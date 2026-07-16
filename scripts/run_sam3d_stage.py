@@ -53,6 +53,44 @@ def export_sam3d_mesh(outputs, mesh_path, high_mesh_path):
         mesh_source.export(high_mesh_path)
 
 
+
+def to_numpy(value):
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value)
+
+
+def to_video_frames(video_output):
+    if isinstance(video_output, dict):
+        for key in ("color", "images", "frames", "rgb"):
+            if key in video_output:
+                video_output = video_output[key]
+                break
+        else:
+            raise ValueError(f"Unsupported render_video dict keys: {list(video_output.keys())}")
+
+    if isinstance(video_output, (list, tuple)):
+        frames = [to_numpy(frame) for frame in video_output]
+    else:
+        frames_array = to_numpy(video_output)
+        if frames_array.ndim != 4:
+            raise ValueError(f"Expected 4D video tensor/array, got shape {frames_array.shape}")
+        if frames_array.shape[1] in (3, 4) and frames_array.shape[-1] not in (3, 4):
+            frames_array = np.transpose(frames_array, (0, 2, 3, 1))
+        frames = [frame for frame in frames_array]
+
+    normalized_frames = []
+    for frame in frames:
+        frame = to_numpy(frame)
+        if frame.ndim == 3 and frame.shape[0] in (3, 4) and frame.shape[-1] not in (3, 4):
+            frame = np.transpose(frame, (1, 2, 0))
+        if frame.dtype != np.uint8:
+            if np.nanmax(frame) <= 1.0:
+                frame = frame * 255.0
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        normalized_frames.append(frame)
+    return normalized_frames
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SAM 3D Objects generation in its own environment.")
     parser.add_argument("--sam3d-root", required=True)
@@ -81,7 +119,7 @@ def main():
         outputs["gs"].save_ply(args.splat_path)
         scene_gs = ready_gaussian_for_video_rendering(outputs["gs"], in_place=False, fix_alignment=True)
         video_geo = render_sam3d_video(scene_gs, resolution=1024, num_frames=120)
-        imageio.mimsave(args.video_path, video_geo, fps=15)
+        imageio.mimsave(args.video_path, to_video_frames(video_geo), fps=15)
 
     export_sam3d_mesh(outputs, args.mesh_path, args.high_mesh_path)
 
