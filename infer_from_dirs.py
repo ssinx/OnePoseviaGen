@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 import subprocess
@@ -510,7 +511,7 @@ def rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_p
     return scaled_model_path, high_mesh_path
 
 
-def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path):
+def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path, anchor_index=0):
     pose_debug_dir = os.path.join(workspace, "pose_debug")
     pose_dir = os.path.join(workspace, "pose_result")
     os.makedirs(pose_debug_dir, exist_ok=True)
@@ -534,6 +535,7 @@ def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_
         pose_debug_dir,
         debug=0,
         est_refine_iter=5,
+        anchor_index=anchor_index,
     )
 
     poses_file_path = os.path.join(pose_dir, "poses.json")
@@ -573,8 +575,14 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
 
     models = DirInferenceModels()
     depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode)
+    del models
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
     scaled_model_path, high_mesh_path = rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path)
-    pose_video, poses_json = estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path)
+    pose_video, poses_json = estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path, anchor_index=anchor_index)
     outputs = {
         "workspace": workspace,
         "depth_video": depth_video,
