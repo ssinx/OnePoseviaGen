@@ -91,6 +91,18 @@ def to_video_frames(video_output):
         normalized_frames.append(frame)
     return normalized_frames
 
+
+def write_video(path, frames, fps=15):
+    try:
+        imageio.mimsave(path, frames, fps=fps, codec="libx264")
+    except Exception as first_error:
+        try:
+            imageio.mimsave(path, frames, fps=fps, codec="mpeg4")
+        except Exception as second_error:
+            print(f"[WARN] Failed to save preview video with libx264: {first_error}", file=sys.stderr)
+            print(f"[WARN] Failed to save preview video with mpeg4: {second_error}", file=sys.stderr)
+            print("[WARN] Continuing without preview video; mesh and splat export are unaffected.", file=sys.stderr)
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Run SAM 3D Objects generation in its own environment.")
     parser.add_argument("--sam3d-root", required=True)
@@ -119,7 +131,7 @@ def main():
         outputs["gs"].save_ply(args.splat_path)
         scene_gs = ready_gaussian_for_video_rendering(outputs["gs"], in_place=False, fix_alignment=True)
         video_geo = render_sam3d_video(scene_gs, resolution=1024, num_frames=120)
-        imageio.mimsave(args.video_path, to_video_frames(video_geo), fps=15)
+        write_video(args.video_path, to_video_frames(video_geo), fps=15)
 
     export_sam3d_mesh(outputs, args.mesh_path, args.high_mesh_path)
 
