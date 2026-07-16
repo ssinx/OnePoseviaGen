@@ -1,7 +1,6 @@
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -10,8 +9,10 @@ from pathlib import Path
 
 os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
 os.environ["ATTN_BACKEND"] = "xformers"
+os.environ.setdefault("CONDA_PREFIX", sys.prefix)
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+SAM3D_OBJECTS_ROOT = PROJECT_ROOT.parent / "sam-3d-objects"
 LOCAL_PACKAGE_PATHS = [
     PROJECT_ROOT / "oneposeviagen" / "SpaTrackerV2",
     PROJECT_ROOT / "oneposeviagen" / "Amodal3R",
@@ -23,16 +24,12 @@ for package_path in reversed(LOCAL_PACKAGE_PATHS):
         sys.path.insert(0, str(package_path))
 
 import cv2
-import imageio
 import numpy as np
 import torch
 import trimesh
 from PIL import Image
 
-from amodal3r.pipelines import Amodal3RImageTo3DPipeline
-from amodal3r.utils import postprocessing_utils, render_utils
 from app_3rd.spatrack_utils.infer_track import get_points_on_a_grid, get_tracker_predictor
-from einops import rearrange
 from fpose.recover_scale import recover_scale
 from models.SpaTrackV2.models.predictor import Predictor
 from models.SpaTrackV2.models.vggt4track.models.vggt_moe import VGGT4Track
@@ -40,14 +37,12 @@ from models.SpaTrackV2.models.vggt4track.utils.load_fn import preprocess_image
 from oneposeviagen.scripts.estimate_poses import estimate_poses
 from oneposeviagen.scripts.render_normals import render_high_model_to_normal_video
 from torchvision.utils import save_image
-from trellis.pipelines import TrellisImageTo3DPipeline
-from trellis.utils import postprocessing_utils as postprocessing_utils_hi3dgen
-from trellis.utils import render_utils as render_utils_hi3dgen
 
 
 MAX_FRAMES_OFFLINE = 50
 MAX_SEED = np.iinfo(np.int32).max
 VIDEO_FPS = 10
+
 
 
 def sorted_image_paths(directory):
@@ -152,17 +147,8 @@ class DirInferenceModels:
             "checkpoints/OnePoseViaGen/SpatialTrackerV2/tracker_online"
         ).eval()
 
-        print("🚀 Loading Amodal3R models...")
-        self.amodal3r_pipeline = Amodal3RImageTo3DPipeline.from_pretrained(
-            "checkpoints/OnePoseViaGen/Amodal3R"
-        )
-        self.amodal3r_pipeline.cuda()
-
-        print("🚀 Loading Hi3DGen_Color models...")
-        self.hi3dgen_pipeline = TrellisImageTo3DPipeline.from_pretrained(
-            "checkpoints/OnePoseViaGen/Hi3DGen_Color"
-        )
-        self.hi3dgen_pipeline.cuda()
+        self.amodal3r_pipeline = None
+        self.hi3dgen_pipeline = None
         print("✅ Models loaded.")
 
 
@@ -358,49 +344,46 @@ def mask_image(rgb_path, mask_path):
     return output
 
 
-def save_mesh(mesh_result, filename):
-    vertices = mesh_result.vertices.cpu().numpy() if hasattr(mesh_result.vertices, "cpu") else mesh_result.vertices
-    faces = mesh_result.faces.cpu().numpy() if hasattr(mesh_result.faces, "cpu") else mesh_result.faces
-    mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-    if mesh_result.vertex_attrs is not None:
-        attrs = mesh_result.vertex_attrs.cpu().numpy() if hasattr(mesh_result.vertex_attrs, "cpu") else mesh_result.vertex_attrs
-        mesh.visual.vertex_colors = attrs
-    mesh.export(filename)
+def mask_image_and_mask(rgb_path, mask_path):
+    rgb_image = mask_image(rgb_path, mask_path)
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    _, mask_binary = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
+    bbox = np.argwhere(mask_binary > 0.8 * 255)
+    if len(bbox) == 0:
+        return rgb_image, Image.fromarray(mask_binary)
+    bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
+    center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
+    size = int(max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * 1.2)
+    crop_box = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
+    cropped_mask = Image.fromarray(mask_binary).crop(crop_box).resize((518, 518), Image.NEAREST)
+    return rgb_image, cropped_mask
 
 
-def generate_3d(models, image, mask, workspace, export_format="obj", seed=-1,
-                ss_guidance_strength=7.5, ss_sampling_steps=12,
-                slat_guidance_strength=3, slat_sampling_steps=12,
-                is_occluded=False):
+def run_sam3d_subprocess(image_path, mask_path, mesh_path, high_mesh_path, video_path, splat_path, seed):
+    helper_script = PROJECT_ROOT / "scripts" / "run_sam3d_stage.py"
+    sam3d_python = os.environ.get("SAM3D_PYTHON")
+    if sam3d_python:
+        command = [sam3d_python, str(helper_script)]
+    else:
+        sam3d_env = os.environ.get("SAM3D_CONDA_ENV", "sam3d-objects")
+        command = ["conda", "run", "-n", sam3d_env, "python", str(helper_script)]
+
+    command.extend([
+        "--sam3d-root", str(SAM3D_OBJECTS_ROOT),
+        "--image", image_path,
+        "--mask", mask_path,
+        "--mesh-path", mesh_path,
+        "--high-mesh-path", high_mesh_path,
+        "--video-path", video_path,
+        "--splat-path", splat_path,
+        "--seed", str(seed),
+    ])
+    subprocess.run(command, check=True)
+
+
+def generate_3d_with_sam3d(models, image, mask, workspace, export_format="obj", seed=-1):
     if seed == -1:
         seed = np.random.randint(0, MAX_SEED)
-
-    if is_occluded:
-        outputs = models.amodal3r_pipeline.run_multi_image(
-            [image],
-            [mask],
-            seed=seed,
-            formats=["mesh", "gaussian"],
-            sparse_structure_sampler_params={"steps": ss_sampling_steps, "cfg_strength": ss_guidance_strength},
-            slat_sampler_params={"steps": slat_sampling_steps, "cfg_strength": slat_guidance_strength},
-        )
-        generated_mesh = outputs["mesh"][0]
-        generated_gs = outputs["gaussian"][0]
-        video_geo = render_utils.render_video(generated_gs, resolution=1024, num_frames=120)["color"]
-        trimesh_mesh = postprocessing_utils.to_glb(generated_gs, generated_mesh, verbose=False)
-    else:
-        outputs = models.hi3dgen_pipeline.run(
-            image,
-            seed=seed,
-            formats=["mesh", "gaussian"],
-            preprocess_image=True,
-            sparse_structure_sampler_params={"steps": ss_sampling_steps, "cfg_strength": ss_guidance_strength},
-            slat_sampler_params={"steps": slat_sampling_steps, "cfg_strength": slat_guidance_strength},
-        )
-        generated_mesh = outputs["mesh"][0]
-        generated_gs = outputs["gaussian"][0]
-        video_geo = render_utils_hi3dgen.render_video(generated_mesh, resolution=1024, num_frames=120)["color"]
-        trimesh_mesh = postprocessing_utils_hi3dgen.to_trimesh(generated_gs, generated_mesh, verbose=False)
 
     model_dir = os.path.join(workspace, "model")
     model_middle_dir = os.path.join(model_dir, "middle_file")
@@ -409,13 +392,26 @@ def generate_3d(models, image, mask, workspace, export_format="obj", seed=-1,
     video_path = os.path.join(model_middle_dir, f"{output_id}_preview.mp4")
     mesh_path = os.path.join(model_dir, f"model.{export_format}")
     high_mesh_path = os.path.join(model_middle_dir, f"{output_id}_high_mesh.obj")
+    splat_path = os.path.join(model_middle_dir, f"{output_id}_splat.ply")
+    sam3d_image_path = os.path.join(model_middle_dir, f"{output_id}_sam3d_input.png")
+    sam3d_mask_path = os.path.join(model_middle_dir, f"{output_id}_sam3d_mask.png")
 
-    imageio.mimsave(video_path, video_geo, fps=15)
-    rotation = trimesh.transformations.rotation_matrix(np.pi / 2, [1, 0, 0])
-    trimesh_mesh.apply_transform(rotation)
-    trimesh_mesh.export(mesh_path, file_type="obj")
-    save_mesh(generated_mesh, high_mesh_path)
+    image_pil = image.convert("RGB") if isinstance(image, Image.Image) else Image.fromarray(np.array(image).astype(np.uint8)).convert("RGB")
+    mask_np = np.array(mask if not isinstance(mask, Image.Image) else mask.convert("L"))
+    mask_np = mask_np == 188 if np.any(mask_np == 188) else mask_np > 0
+    mask_pil = Image.fromarray(mask_np.astype(np.uint8) * 255)
+
+    image_pil.save(sam3d_image_path)
+    mask_pil.save(sam3d_mask_path)
+    run_sam3d_subprocess(sam3d_image_path, sam3d_mask_path, mesh_path, high_mesh_path, video_path, splat_path, seed)
     return video_path, mesh_path, high_mesh_path
+
+
+def generate_3d(models, image, mask, workspace, export_format="obj", seed=-1,
+                ss_guidance_strength=7.5, ss_sampling_steps=12,
+                slat_guidance_strength=3, slat_sampling_steps=12,
+                is_occluded=False):
+    return generate_3d_with_sam3d(models, image, mask, workspace, export_format=export_format, seed=seed)
 
 
 def recover_true_scale(normal_model_path, anchor_depth_name, anchor_intrinsic, anchor_image_name, anchor_mask_name, output_dir):
@@ -482,7 +478,7 @@ def generate_model_and_rescale_from_workspace(models, workspace, anchor_index=No
         final_mask_np = np.ones_like(mask, dtype=np.uint8) * 255
         final_mask_np[mask > 127] = 188
         final_mask = Image.fromarray(final_mask_np)
-        rgb_image = mask_image(rgb_names[anchor_index], mask_names[anchor_index])
+        rgb_image, final_mask = mask_image_and_mask(rgb_names[anchor_index], mask_names[anchor_index])
     final_mask.save(os.path.join(model_dir, "final_mask.png"))
 
     actual_seed = np.random.randint(0, MAX_SEED) if randomize_seed else seed
