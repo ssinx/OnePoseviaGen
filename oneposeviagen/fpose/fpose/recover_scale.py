@@ -114,7 +114,7 @@ def get_single_pose(raw_img, depth, mask, intrinsic, mesh, topic, num, debug, es
 
     return pose.reshape(4,4)
 
-def recover_scale(mesh_file, depth_file, raw_img, mask_file, intrinsic_file, topic, out_dir):
+def recover_scale(mesh_file, depth_file, raw_img, mask_file, intrinsic_file, topic, out_dir, crop_padding=1.2):
     mesh = trimesh.load(mesh_file, force='mesh')
     mesh_rotated = mesh.copy()
 
@@ -122,7 +122,7 @@ def recover_scale(mesh_file, depth_file, raw_img, mask_file, intrinsic_file, top
     poses = []
 
     #进行模型缩放比例和位姿的确定
-    M, intrinsic_numpy, scale = get_scale(mesh_file, depth_file, raw_img, mask_file, out_dir, intrinsic_file)
+    M, intrinsic_numpy, scale = get_scale(mesh_file, depth_file, raw_img, mask_file, out_dir, intrinsic_file, crop_padding=crop_padding)
     scales.append(scale)
     scale_matrix = np.array([[scale, 0, 0, 0],
                              [0, scale, 0, 0],
@@ -150,7 +150,7 @@ def recover_scale(mesh_file, depth_file, raw_img, mask_file, intrinsic_file, top
         #根据得到的位姿再次进行转换矩阵估计
         scale_output = os.path.join(out_dir, f"iteration_{i+1}")
         os.makedirs(scale_output, exist_ok=True)
-        M, intrinsic_numpy, scale = get_scale(rotated_mesh_dir, depth_file, raw_img, mask_file, scale_output, intrinsic_file)
+        M, intrinsic_numpy, scale = get_scale(rotated_mesh_dir, depth_file, raw_img, mask_file, scale_output, intrinsic_file, crop_padding=crop_padding)
         if scale > 1.5 or scale < 0.5:
            i = i - 1
            continue

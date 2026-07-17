@@ -339,7 +339,7 @@ def generate_final_mask(seg_path, depth_path, area_threshold=100, max_iter=50):
     return Image.fromarray(final_mask)
 
 
-def mask_image(rgb_path, mask_path):
+def mask_image(rgb_path, mask_path, crop_padding=1.2):
     input_image = Image.open(rgb_path).convert("RGB")
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     _, mask_binary = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
@@ -351,14 +351,14 @@ def mask_image(rgb_path, mask_path):
         return output
     bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
     center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-    size = int(max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * 1.2)
+    size = int(max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * crop_padding)
     crop_box = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
     output = output.crop(crop_box).resize((518, 518), Image.LANCZOS)
     return output
 
 
-def mask_image_and_mask(rgb_path, mask_path):
-    rgb_image = mask_image(rgb_path, mask_path)
+def mask_image_and_mask(rgb_path, mask_path, crop_padding=1.2):
+    rgb_image = mask_image(rgb_path, mask_path, crop_padding=crop_padding)
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
     _, mask_binary = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
     bbox = np.argwhere(mask_binary > 0.8 * 255)
@@ -366,7 +366,7 @@ def mask_image_and_mask(rgb_path, mask_path):
         return rgb_image, Image.fromarray(mask_binary)
     bbox = np.min(bbox[:, 1]), np.min(bbox[:, 0]), np.max(bbox[:, 1]), np.max(bbox[:, 0])
     center = (bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2
-    size = int(max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * 1.2)
+    size = int(max(bbox[2] - bbox[0], bbox[3] - bbox[1]) * crop_padding)
     crop_box = center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
     cropped_mask = Image.fromarray(mask_binary).crop(crop_box).resize((518, 518), Image.NEAREST)
     return rgb_image, cropped_mask
@@ -427,7 +427,7 @@ def generate_3d(models, image, mask, workspace, export_format="obj", seed=-1,
     return generate_3d_with_sam3d(models, image, mask, workspace, export_format=export_format, seed=seed)
 
 
-def recover_true_scale(normal_model_path, anchor_depth_name, anchor_intrinsic, anchor_image_name, anchor_mask_name, output_dir):
+def recover_true_scale(normal_model_path, anchor_depth_name, anchor_intrinsic, anchor_image_name, anchor_mask_name, output_dir, crop_padding=1.2):
     anchor_dir = os.path.join(output_dir, "anchor_file")
     os.makedirs(anchor_dir, exist_ok=True)
     intrinsic_file = os.path.join(anchor_dir, "intrinsic.txt")
@@ -443,6 +443,7 @@ def recover_true_scale(normal_model_path, anchor_depth_name, anchor_intrinsic, a
         intrinsic_file,
         "test",
         mid_dir,
+        crop_padding=crop_padding,
     )
     scaled_mesh.export(scaled_mesh_path)
     return scaled_mesh_path, final_scale, pose
@@ -470,7 +471,7 @@ def choose_anchor_index(mask_names):
 def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomize_seed=False,
                                   ss_guidance_strength=7.5, ss_sampling_steps=12,
                                   slat_guidance_strength=3, slat_sampling_steps=12,
-                                  is_occluded=False):
+                                  is_occluded=False, crop_padding=1.2):
     rgb_names = sorted_image_paths(os.path.join(workspace, "rgb"))
     mask_names = sorted_image_paths(os.path.join(workspace, "masks"))
     if anchor_index is None:
@@ -480,7 +481,7 @@ def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomiz
 
     model_dir = os.path.join(workspace, "model")
     os.makedirs(model_dir, exist_ok=True)
-    rgb_image, final_mask = mask_image_and_mask(rgb_names[anchor_index], mask_names[anchor_index])
+    rgb_image, final_mask = mask_image_and_mask(rgb_names[anchor_index], mask_names[anchor_index], crop_padding=crop_padding)
     final_mask.save(os.path.join(model_dir, "final_mask.png"))
 
     actual_seed = np.random.randint(0, MAX_SEED) if randomize_seed else seed
@@ -499,7 +500,7 @@ def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomiz
     )
 
 
-def rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path):
+def rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path, crop_padding=1.2):
     rgb_names = sorted_image_paths(os.path.join(workspace, "rgb"))
     mask_names = sorted_image_paths(os.path.join(workspace, "masks"))
     depth_names = sorted_image_paths(os.path.join(workspace, "depth"))
@@ -516,6 +517,7 @@ def rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_p
         rgb_names[anchor_index],
         mask_names[anchor_index],
         model_dir,
+        crop_padding=crop_padding,
     )
     high_mesh = trimesh.load(high_mesh_path)
     high_mesh.vertices = high_mesh.vertices * scale
@@ -565,7 +567,7 @@ def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_
 def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE,
                             grid_size=50, vo_points=756, mode="offline", anchor_index=None, seed=0,
                             randomize_seed=False, ss_guidance_strength=7.5, ss_sampling_steps=12,
-                            slat_guidance_strength=3, slat_sampling_steps=12, is_occluded=False):
+                            slat_guidance_strength=3, slat_sampling_steps=12, is_occluded=False, crop_padding=1.2):
     workspace = create_workspace(output_dir)
     prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=frame_stride, max_frames=max_frames)
     if anchor_index is None:
@@ -580,6 +582,7 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         slat_guidance_strength=slat_guidance_strength,
         slat_sampling_steps=slat_sampling_steps,
         is_occluded=is_occluded,
+        crop_padding=crop_padding,
     )
 
     if torch.cuda.is_available():
@@ -593,7 +596,7 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    scaled_model_path, high_mesh_path = rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path)
+    scaled_model_path, high_mesh_path = rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path, crop_padding=crop_padding)
     pose_video, poses_json = estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path, anchor_index=anchor_index)
     outputs = {
         "workspace": workspace,
@@ -629,6 +632,7 @@ def parse_args():
     parser.add_argument("--slat-guidance-strength", type=float, default=3)
     parser.add_argument("--slat-sampling-steps", type=int, default=12)
     parser.add_argument("--is-occluded", action="store_true")
+    parser.add_argument("--crop-padding", type=float, default=1.2, help="BBox expansion factor for anchor image/mask crop before 3D generation.")
     return parser.parse_args()
 
 

@@ -19,7 +19,7 @@ from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import TexturesVertex
 
-def crop_object_with_mask(image_path, mask_path):
+def crop_object_with_mask(image_path, mask_path, crop_padding=1.2):
     # 读取原图和mask图片
     image = cv2.imread(image_path)
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -52,8 +52,15 @@ def crop_object_with_mask(image_path, mask_path):
     # 计算最大轮廓的边界框
     x, y, w, h = cv2.boundingRect(largest_contour)
 
-    # 根据边界框裁剪提取出的物体
-    cropped_object = cropped_image[y:y+h, x:x+w]
+    # 根据边界框裁剪提取出的物体，并保留一定上下文以提升特征匹配稳定性
+    center_x = x + w / 2
+    center_y = y + h / 2
+    size = int(max(w, h) * crop_padding)
+    x1 = max(0, int(center_x - size / 2))
+    y1 = max(0, int(center_y - size / 2))
+    x2 = min(image.shape[1], int(center_x + size / 2))
+    y2 = min(image.shape[0], int(center_y + size / 2))
+    cropped_object = cropped_image[y1:y2, x1:x2]
 
     return cropped_object
 
@@ -487,7 +494,7 @@ def rgbd_to_pointcloud(rgb_file, depth_file, intrinsic, out_dir):
                                                         
     return pcd
 
-def get_scale(mesh, depth_file, raw_img, mask_file, out_dir, intrinsic_file, sample_flag=0, input_pose=np.eye(4)):
+def get_scale(mesh, depth_file, raw_img, mask_file, out_dir, intrinsic_file, sample_flag=0, input_pose=np.eye(4), crop_padding=1.2):
     intrinsic_tensor, intrinsic_numpy = get_intrinsic(intrinsic_file)
 
     pcd = rgbd_to_pointcloud(raw_img, depth_file, intrinsic_tensor, out_dir)
@@ -500,7 +507,7 @@ def get_scale(mesh, depth_file, raw_img, mask_file, out_dir, intrinsic_file, sam
     # print(mask_box)
 
     ref_img = os.path.join(out_dir, 'ref_img.png')
-    ref = crop_object_with_mask(raw_img, mask_file)
+    ref = crop_object_with_mask(raw_img, mask_file, crop_padding=crop_padding)
     cv2.imwrite(ref_img, ref)
     
     optimal_scale, M, plane_model, field_of_view = estimate_pose(mesh, pcd_file, ref_img, raw_img, mask_box, out_dir, sample_flag=sample_flag, input_pose=input_pose)
