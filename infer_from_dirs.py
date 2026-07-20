@@ -403,7 +403,24 @@ def run_flashvsr_super_resolution(input_image_path, output_image_path, script_pa
             command = ["conda", "run", "-n", flashvsr_env, "python", str(script_path)]
         command.extend(["--input_path", str(input_image_path), "--output_path", str(output_image_path)])
 
-    subprocess.run(command, check=True)
+    try:
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        output = exc.stdout or "<no FlashVSR output captured>"
+        raise RuntimeError(
+            "FlashVSR execution failed.\n"
+            f"Command: {shlex.join(command)}\n"
+            f"Output:\n{output}"
+        ) from exc
+
+    if result.stdout:
+        print(result.stdout, end="")
     if output_image_path.exists():
         return str(output_image_path)
 
@@ -476,7 +493,7 @@ def generate_3d_with_sam3d(models, image, mask, workspace, export_format="obj", 
                 mask_pil = mask_pil.resize(superres_size, Image.NEAREST)
                 mask_pil.save(sam3d_mask_path)
             print(f"🔍 FlashVSR super-resolution applied: {sam3d_image_path}")
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        except (FileNotFoundError, RuntimeError) as exc:
             if strict_superres:
                 raise
             print(f"⚠️  Skip FlashVSR super-resolution: {exc}")
