@@ -19,7 +19,7 @@ from pytorch3d.io import load_objs_as_meshes
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import TexturesVertex
 
-def crop_object_with_mask(image_path, mask_path, crop_padding=1.2):
+def crop_object_with_mask(image_path, mask_path, crop_padding=1.2, return_crop_box=False):
     # 读取原图和mask图片
     image = cv2.imread(image_path)
     mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -62,6 +62,8 @@ def crop_object_with_mask(image_path, mask_path, crop_padding=1.2):
     y2 = min(image.shape[0], int(center_y + size / 2))
     cropped_object = cropped_image[y1:y2, x1:x2]
 
+    if return_crop_box:
+        return cropped_object, (x1, y1, x2, y2)
     return cropped_object
 
 
@@ -262,20 +264,84 @@ def project_2d_to_3d(image_points, depth, camera_intrinsics, camera_pose):
     """
     fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
     cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
-    # Convert image points to normalized device coordinates (NDC)
-    ndc_points = np.zeros((image_points.shape[0], 3))
-    for i, (u, v) in enumerate(image_points):
-        z = depth[int(v), int(u)]
-        x = - (u - cx) * z / fx
-        y = - (v - cy) * z / fy
-        ndc_points[i] = [x, y, z]
-    valid_mask = ndc_points[:, 2] > 0
-    ndc_points = ndc_points[valid_mask]
+    image_points = np.asarray(image_points, dtype=np.float32)
+    pixel_x = np.floor(image_points[:, 0]).astype(np.int32)
+    pixel_y = np.floor(image_points[:, 1]).astype(np.int32)
+    valid_mask = (
+        (pixel_x >= 0)
+        & (pixel_y >= 0)
+        & (pixel_x < depth.shape[1])
+        & (pixel_y < depth.shape[0])
+    )
+    valid_indices = np.where(valid_mask)[0]
+    depth_values = np.zeros(len(image_points), dtype=np.float32)
+    depth_values[valid_indices] = depth[pixel_y[valid_indices], pixel_x[valid_indices]]
+    valid_mask &= np.isfinite(depth_values) & (depth_values > 0)
+    valid_points = image_points[valid_mask]
+    valid_depths = depth_values[valid_mask]
+    ndc_points = np.column_stack([
+        - (valid_points[:, 0] - cx) * valid_depths / fx,
+        - (valid_points[:, 1] - cy) * valid_depths / fy,
+        valid_depths,
+    ])
     # ndc_points = np.vstack((ndc_points, np.zeros(3), [[0, 0, 0]])) # modified
     # Convert from camera coordinates to world coordinates
     ndc_points_homogeneous = np.hstack((ndc_points, np.ones((ndc_points.shape[0], 1))))
     world_points_homogeneous = ndc_points_homogeneous @ np.linalg.inv(camera_pose)
     return world_points_homogeneous[:, :3], valid_mask
+
+
+def get_matched_superglue_points(match_result):
+    matches = match_result['matches']
+    matched_mask = matches > -1
+    return (
+        match_result['keypoints0'][matched_mask],
+        match_result['keypoints1'][matches[matched_mask]],
+    )
+
+
+def get_matched_sift_points(render_image, reference_image, max_keypoints=4096, ratio_threshold=0.8):
+    if not hasattr(cv2, 'SIFT_create'):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    render_image = clahe.apply(render_image)
+    reference_image = clahe.apply(reference_image)
+    detector = cv2.SIFT_create(nfeatures=max_keypoints)
+    render_keypoints, render_descriptors = detector.detectAndCompute(render_image, None)
+    reference_keypoints, reference_descriptors = detector.detectAndCompute(reference_image, None)
+    if render_descriptors is None or reference_descriptors is None:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    knn_matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(render_descriptors, reference_descriptors, k=2)
+    matches = []
+    used_reference_indices = set()
+    for match_pair in knn_matches:
+        if len(match_pair) < 2:
+            continue
+        nearest, second_nearest = match_pair
+        if nearest.distance >= ratio_threshold * second_nearest.distance:
+            continue
+        if nearest.trainIdx in used_reference_indices:
+            continue
+        used_reference_indices.add(nearest.trainIdx)
+        matches.append(nearest)
+    if not matches:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    return (
+        np.asarray([render_keypoints[match.queryIdx].pt for match in matches], dtype=np.float32),
+        np.asarray([reference_keypoints[match.trainIdx].pt for match in matches], dtype=np.float32),
+    )
+
+
+def get_valid_render_matches(render_points, reference_points, depth, camera_intrinsics, camera_pose, ref_crop_box, ref_image_shape):
+    world_points, valid_mask = project_2d_to_3d(render_points, depth, camera_intrinsics, camera_pose)
+    render_points = render_points[valid_mask]
+    reference_points = reference_points[valid_mask]
+    crop_width = ref_crop_box[2] - ref_crop_box[0]
+    crop_height = ref_crop_box[3] - ref_crop_box[1]
+    scale_x = crop_width / ref_image_shape[1]
+    scale_y = crop_height / ref_image_shape[0]
+    raw_points = reference_points * np.array([scale_x, scale_y]) + np.array(ref_crop_box[:2])
+    return world_points, raw_points, render_points
 
 def plot_mesh_with_points(mesh, points, filename):
     fig = plt.figure()
@@ -329,7 +395,7 @@ def fit_plane(pcd, filter_z=1, distance_threshold=0.002):
     field_of_view = np.array([min_x, min_y, max_x, max_y])
     return plane_model, field_of_view
 
-def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, mask_box, out_dir, num_samples=8, num_ups=1, sample_flag = 0, input_pose = np.eye(4)):
+def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, num_samples=8, num_ups=1, sample_flag = 0, input_pose = np.eye(4)):
     # load 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     mesh = trimesh.load(mesh_file)
@@ -358,55 +424,136 @@ def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, mask_box, out_dir, num_
                                                                           num_samples=num_samples, num_ups=num_ups, device=device, sample_flag=sample_flag, input_pose=input_pose)
     grays = [cv2.cvtColor(color, cv2.COLOR_BGR2GRAY) for color in colors]
     print('matching features...')
-    best_pose, match_result = image_pair_matching(grays, ref_img, out_dir,
-                                    resize=[-1], viz=False, save=False, keypoint_threshold=0.001, match_threshold=0.01)
-    chosen_pose = camera_poses[best_pose].cpu().numpy()
-    # print('best_pose', np.array2string(chosen_pose, separator=', '))
-    # print('matched point number', np.sum(match_result['matches']>-1))
+    _, _, match_results, _ = image_pair_matching(
+        grays,
+        ref_img,
+        out_dir,
+        resize=[-1],
+        viz=False,
+        save=False,
+        max_keypoints=2048,
+        keypoint_threshold=0.0005,
+        match_threshold=0.005,
+        return_all=True,
+    )
+    candidates = []
+    matching_stats = []
+    for pose_index, match_result in enumerate(match_results):
+        candidate_pose = camera_poses[pose_index].cpu().numpy()
+        superglue_render_points, superglue_reference_points = get_matched_superglue_points(match_result)
+        sift_render_points, sift_reference_points = get_matched_sift_points(grays[pose_index], ref_img)
+        render_points = np.concatenate([superglue_render_points, sift_render_points], axis=0)
+        reference_points = np.concatenate([superglue_reference_points, sift_reference_points], axis=0)
+        world_points, raw_points, valid_render_points = get_valid_render_matches(
+            render_points,
+            reference_points,
+            depths[pose_index],
+            camera_intrinsics,
+            candidate_pose,
+            ref_crop_box,
+            ref_img.shape,
+        )
+        pnp_success = False
+        rotation_vector = None
+        translation_vector = None
+        inliers = None
+        if len(world_points) >= 4:
+            pnp_success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(
+                np.float32(world_points),
+                np.float32(raw_points),
+                np.float32(camera_intrinsics),
+                distCoeffs=np.zeros(4, dtype=np.float32),
+                iterationsCount=1000,
+                reprojectionError=4.0,
+                confidence=0.999,
+                flags=cv2.SOLVEPNP_EPNP,
+            )
+        inlier_count = 0 if inliers is None else len(inliers)
+        candidates.append({
+            "pose_index": pose_index,
+            "world_points": world_points,
+            "raw_points": raw_points,
+            "render_points": valid_render_points,
+            "pnp_success": pnp_success and inlier_count >= 4,
+            "rotation_vector": rotation_vector,
+            "translation_vector": translation_vector,
+            "inliers": inliers,
+            "inlier_count": inlier_count,
+        })
+        matching_stats.append({
+            "pose_index": pose_index,
+            "superglue_match_count": int(len(superglue_render_points)),
+            "sift_match_count": int(len(sift_render_points)),
+            "valid_3d_match_count": int(len(world_points)),
+            "pnp_inlier_count": int(inlier_count),
+            "pnp_success": bool(pnp_success and inlier_count >= 4),
+        })
+    matching_stats_path = os.path.join(out_dir, 'scale_matching_stats.json')
+    pnp_candidates = [candidate for candidate in candidates if candidate["pnp_success"]]
+    if not pnp_candidates:
+        best_candidate = max(candidates, key=lambda candidate: len(candidate["world_points"]))
+        with open(matching_stats_path, 'w') as file:
+            json.dump({
+                "selected_pose_index": best_candidate["pose_index"],
+                "selected_valid_3d_match_count": int(len(best_candidate["world_points"])),
+                "pnp_status": "failed_no_valid_candidate",
+                "candidates": matching_stats,
+            }, file, indent=2)
+        raise RuntimeError(
+            "Scale recovery could not establish four geometrically consistent mesh-to-image correspondences. "
+            f"Inspect {matching_stats_path}, points_on_2D.png, and points_original.png."
+        )
+
+    best_candidate = max(
+        pnp_candidates,
+        key=lambda candidate: (candidate["inlier_count"], len(candidate["world_points"])),
+    )
+    best_pose = best_candidate["pose_index"]
+    world_points = best_candidate["world_points"]
+    match_points_on_raw = best_candidate["raw_points"]
+    render_points = best_candidate["render_points"]
+    rvec = best_candidate["rotation_vector"]
+    tvec = best_candidate["translation_vector"]
+    inliers = best_candidate["inliers"].reshape(-1)
+    if hasattr(cv2, 'solvePnPRefineLM'):
+        rvec, tvec = cv2.solvePnPRefineLM(
+            np.float32(world_points[inliers]),
+            np.float32(match_points_on_raw[inliers]),
+            np.float32(camera_intrinsics),
+            np.zeros(4, dtype=np.float32),
+            rvec,
+            tvec,
+        )
+    matching_diagnostics = {
+        "selected_pose_index": best_pose,
+        "selected_valid_3d_match_count": int(len(world_points)),
+        "pnp_status": "success",
+        "pnp_inlier_count": int(len(inliers)),
+        "candidates": matching_stats,
+    }
+    print(
+        f"Scale recovery selected render pose {best_pose}: "
+        f"{len(inliers)} PnP inliers from {len(world_points)} valid 3D correspondences "
+        f"(diagnostics: {matching_stats_path})"
+    )
     plt.imsave(os.path.join(out_dir, 'initial_pose.png'), colors[0])
     plt.imsave(os.path.join(out_dir, 'best_pose_rendering.png'), colors[best_pose])
-    # chosen_pose[:, 1:3] = -chosen_pose[:, 1:3] # Change due to pyrender's special coordinates
-
-    # Matched points on mesh
-    image_points = match_result['keypoints0'][match_result['matches']>-1]
-    world_points, valid_mask = project_2d_to_3d(image_points, depths[best_pose],
-                                                camera_intrinsics, chosen_pose)
-    image_points = image_points[valid_mask]
     plot_mesh_with_points(mesh, world_points, os.path.join(out_dir, 'points_on_3D.png'))
-    plot_image_with_points(depths[best_pose], image_points, os.path.join(out_dir, 'points_on_2D.png'))
-
-    # Matched points on original picture
-    match_points_on_mask = match_result['keypoints1'][match_result['matches'][match_result['matches']>-1]]
-    match_points_on_mask = match_points_on_mask[valid_mask]
-    sclae_x = (mask_box[3]-mask_box[1]) / ref_img.shape[1]
-    sclae_y = (mask_box[2]-mask_box[0]) / ref_img.shape[0]
-    match_points_on_raw = match_points_on_mask * np.array([sclae_x, sclae_y]) + np.array([mask_box[1], mask_box[0]])
+    plot_image_with_points(depths[best_pose], render_points, os.path.join(out_dir, 'points_on_2D.png'))
     plot_image_with_points(raw_img, match_points_on_raw, os.path.join(out_dir, 'points_original.png'))
 
-    success, rvec, tvec, _ = cv2.solvePnPRansac(
-        np.float32(world_points),
-        np.float32(match_points_on_raw),
-        np.float32(camera_intrinsics),
-        distCoeffs=np.zeros(4, dtype=np.float32),
-        iterationsCount=100,       # 最大迭代次数
-        reprojectionError=8.0,      # 投影误差阈值
-        confidence=0.99,            # 置信度
-        flags=cv2.SOLVEPNP_ITERATIVE  # 可替换为 SOLVEPNP_EPNP 等
-    )
-    # assert success
     rotation_matrix, _ = cv2.Rodrigues(rvec)
     world_2_cam = np.eye(4, dtype=np.float32)
     world_2_cam[:3, :3] = rotation_matrix
     world_2_cam[:3, 3] = tvec.squeeze()
-    # print('Optimized pose', world_2_cam)
-
     world_2_cam_render = np.eye(4, dtype=np.float32)
     world_2_cam_render[:3, :3] = np.linalg.inv(rotation_matrix)
-    world_2_cam_render[3, :3] = tvec.squeeze() # change due to pytorch3D setting
-    world_2_cam_render[:, :2] = -world_2_cam_render[:, :2] # change due to pytorch3D setting
-    # print('Optimized pose for rendering', np.array2string(world_2_cam_render, separator=', '))
+    world_2_cam_render[3, :3] = tvec.squeeze()
+    world_2_cam_render[:, :2] = -world_2_cam_render[:, :2]
     color, _ = render_image(mesh_file, world_2_cam_render, raw_img.shape[1], raw_img.shape[0], fov, device)
     plt.imsave(os.path.join(out_dir, 'optimized_rendering.png'), color[0])
+    with open(matching_stats_path, 'w') as file:
+        json.dump(matching_diagnostics, file, indent=2)
 
     # rescaled mesh points
     # mesh points in camera space
@@ -503,14 +650,25 @@ def get_scale(mesh, depth_file, raw_img, mask_file, out_dir, intrinsic_file, sam
     mask_image = Image.open(mask_file).convert('L')  # 转换为灰度图
     binary_mask = np.array(mask_image) > 0  # 将非零像素视为前景
 
-    mask_box = calculate_bbox_from_mask(binary_mask)
-    # print(mask_box)
-
     ref_img = os.path.join(out_dir, 'ref_img.png')
-    ref = crop_object_with_mask(raw_img, mask_file, crop_padding=crop_padding)
+    ref, ref_crop_box = crop_object_with_mask(
+        raw_img,
+        mask_file,
+        crop_padding=crop_padding,
+        return_crop_box=True,
+    )
     cv2.imwrite(ref_img, ref)
     
-    optimal_scale, M, plane_model, field_of_view = estimate_pose(mesh, pcd_file, ref_img, raw_img, mask_box, out_dir, sample_flag=sample_flag, input_pose=input_pose)
+    optimal_scale, M, plane_model, field_of_view = estimate_pose(
+        mesh,
+        pcd_file,
+        ref_img,
+        raw_img,
+        ref_crop_box,
+        out_dir,
+        sample_flag=sample_flag,
+        input_pose=input_pose,
+    )
     return M, intrinsic_numpy, optimal_scale
 
 if __name__ == "__main__":
@@ -530,4 +688,3 @@ if __name__ == "__main__":
     M_output_path = os.path.join(out_dir, "final_matrix.txt")
     np.savetxt(M_output_path, M, fmt="%.6f")
     print(f"Final matrix M saved to {M_output_path}")
-    

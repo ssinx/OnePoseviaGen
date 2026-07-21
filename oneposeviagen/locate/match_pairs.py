@@ -62,7 +62,7 @@ def image_pair_matching(input_images, ref_image, output_dir, resize=[-1],
                         resize_float=False, superglue='indoor', max_keypoints=1024, 
                         keypoint_threshold=0.005, nms_radius=4, sinkhorn_iterations=20, 
                         match_threshold=0.2, viz=True, fast_viz=False, cache=True, 
-                        show_keypoints=False, viz_extension='png', save=True):
+                        show_keypoints=False, viz_extension='png', save=True, return_all=False):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print('Running inference on device \"{}\"'.format(device))
@@ -165,4 +165,6 @@ def image_pair_matching(input_images, ref_image, output_dir, resize=[-1],
 
             timer.update('viz_match')
     best_pose = match_nums.index(max(match_nums))
+    if return_all:
+        return best_pose, match_result[best_pose], match_result, match_nums
     return best_pose, match_result[best_pose]
