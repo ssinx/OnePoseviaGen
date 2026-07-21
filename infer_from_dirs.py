@@ -347,6 +347,41 @@ def get_mask_crop_box(mask_binary, crop_padding):
     return center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
 
 
+def get_global_mask_crop_box(mask_paths, crop_padding):
+    expected_shape = None
+    crop_boxes = []
+    for mask_path in mask_paths:
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read FlashVSR mask: {mask_path}")
+        if expected_shape is None:
+            expected_shape = mask.shape
+        elif mask.shape != expected_shape:
+            raise ValueError(
+                f"FlashVSR mask resolution mismatch for {mask_path}: {mask.shape[::-1]} vs "
+                f"{expected_shape[::-1]}"
+            )
+        _, mask_binary = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
+        crop_box = get_mask_crop_box(mask_binary, crop_padding)
+        if crop_box is not None:
+            crop_boxes.append(crop_box)
+
+    if not crop_boxes:
+        return None
+
+    left = min(crop_box[0] for crop_box in crop_boxes)
+    top = min(crop_box[1] for crop_box in crop_boxes)
+    right = max(crop_box[2] for crop_box in crop_boxes)
+    bottom = max(crop_box[3] for crop_box in crop_boxes)
+    image_height, image_width = expected_shape
+    return (
+        max(0, int(np.floor(left))),
+        max(0, int(np.floor(top))),
+        min(image_width, int(np.ceil(right))),
+        min(image_height, int(np.ceil(bottom))),
+    )
+
+
 def crop_rgb_with_mask(rgb_path, mask_binary, crop_box, output_size=(518, 518), apply_mask=True):
     input_image = Image.open(rgb_path).convert("RGB")
     if input_image.size != (mask_binary.shape[1], mask_binary.shape[0]):
@@ -399,7 +434,8 @@ def prepare_flashvsr_input_sequence(rgb_paths, mask_paths, anchor_index, output_
     if anchor_mask_array is None:
         raise ValueError(f"Failed to read FlashVSR anchor mask: {mask_paths[anchor_index]}")
     _, anchor_mask_binary = cv2.threshold(anchor_mask_array, 1, 255, cv2.THRESH_BINARY)
-    anchor_crop_box = get_mask_crop_box(anchor_mask_binary, crop_padding)
+    global_crop_box = get_global_mask_crop_box(mask_paths, crop_padding)
+    print(f"FlashVSR global crop box: {global_crop_box}")
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -409,7 +445,7 @@ def prepare_flashvsr_input_sequence(rgb_paths, mask_paths, anchor_index, output_
         image, mask = crop_rgb_with_mask(
             rgb_path,
             anchor_mask_binary,
-            anchor_crop_box,
+            global_crop_box,
             output_size=None,
             apply_mask=False,
         )
