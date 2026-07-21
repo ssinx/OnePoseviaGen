@@ -8,11 +8,11 @@ import torch
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Run FlashVSR on an image sequence and export one enhanced frame.")
+    parser = argparse.ArgumentParser(description="Run FlashVSR on an image sequence and export enhanced frames.")
     parser.add_argument("--flashvsr-script", required=True)
     parser.add_argument("--input-dir", required=True)
-    parser.add_argument("--output", required=True)
-    parser.add_argument("--target-frame-index", type=int, required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--num-real-frames", type=int, required=True)
     return parser.parse_args()
 
 
@@ -35,10 +35,12 @@ def load_flashvsr_module(script_path):
 def main():
     args = parse_args()
     input_dir = Path(args.input_dir).resolve()
-    output_path = Path(args.output).resolve()
+    output_dir = Path(args.output_dir).resolve()
     if not input_dir.is_dir():
         raise FileNotFoundError(f"Input frame directory not found: {input_dir}")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.num_real_frames < 1:
+        raise ValueError(f"num_real_frames must be positive, got {args.num_real_frames}")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     flashvsr = load_flashvsr_module(args.flashvsr_script)
     lq_video, height, width, frame_count, _ = flashvsr.prepare_input_tensor(
@@ -67,17 +69,18 @@ def main():
             color_fix=True,
         )
         output_frames = flashvsr.tensor2video(output_video)
-        if not 0 <= args.target_frame_index < len(output_frames):
+        if args.num_real_frames > len(output_frames):
             raise RuntimeError(
-                f"Requested frame {args.target_frame_index}, but FlashVSR returned {len(output_frames)} frames."
+                f"Requested {args.num_real_frames} real frames, but FlashVSR returned {len(output_frames)} frames."
             )
-        output_frames[args.target_frame_index].save(output_path)
+        for frame_index, frame in enumerate(output_frames[:args.num_real_frames]):
+            frame.save(output_dir / f"{frame_index:06d}.png")
     finally:
         del pipeline
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
 
-    print(f"Saved FlashVSR frame {args.target_frame_index}: {output_path}")
+    print(f"Saved {args.num_real_frames} FlashVSR frames: {output_dir}")
 
 
 if __name__ == "__main__":

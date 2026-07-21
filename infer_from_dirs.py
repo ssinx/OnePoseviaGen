@@ -88,7 +88,7 @@ def preprocess_mask_tensor(mask_tensor, target_size=518):
     return mask_tensor
 
 
-def prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE):
+def select_input_paths(rgb_dir, mask_dir, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE):
     rgb_paths = sorted_image_paths(rgb_dir)
     mask_paths = sorted_image_paths(mask_dir)
     if not rgb_paths:
@@ -100,6 +100,14 @@ def prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=1, ma
 
     rgb_paths = rgb_paths[::frame_stride][:max_frames]
     mask_paths = mask_paths[::frame_stride][:max_frames]
+    return rgb_paths, mask_paths
+
+
+def prepare_workspace_from_paths(rgb_paths, mask_paths, workspace):
+    if len(rgb_paths) != len(mask_paths):
+        raise ValueError(f"Frame/mask count mismatch: {len(rgb_paths)} frames vs {len(mask_paths)} masks")
+    if not rgb_paths:
+        raise ValueError("No image paths were provided for workspace preparation")
 
     workspace = Path(workspace)
     out_rgb_dir = workspace / "rgb"
@@ -131,6 +139,11 @@ def prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=1, ma
         cv2.imwrite(str(out_mask_dir / f"{frame_id:06d}.png"), mask_image)
 
     return str(out_rgb_dir), str(out_mask_dir)
+
+
+def prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE):
+    rgb_paths, mask_paths = select_input_paths(rgb_dir, mask_dir, frame_stride, max_frames)
+    return prepare_workspace_from_paths(rgb_paths, mask_paths, workspace)
 
 
 class DirInferenceModels:
@@ -439,10 +452,8 @@ def prepare_flashvsr_input_sequence(rgb_paths, mask_paths, anchor_index, output_
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    anchor_image = None
-    anchor_mask = None
     for frame_index, rgb_path in enumerate(rgb_paths):
-        image, mask = crop_rgb_with_mask(
+        image, _ = crop_rgb_with_mask(
             rgb_path,
             anchor_mask_binary,
             global_crop_box,
@@ -450,33 +461,55 @@ def prepare_flashvsr_input_sequence(rgb_paths, mask_paths, anchor_index, output_
             apply_mask=False,
         )
         image.save(output_dir / f"{frame_index:06d}.png")
-        if frame_index == anchor_index:
-            anchor_image = image
-            anchor_mask = mask
 
     target_frame_count = ((len(rgb_paths) + 3 + 7) // 8) * 8 - 3
     last_frame_path = output_dir / f"{len(rgb_paths) - 1:06d}.png"
     for frame_index in range(len(rgb_paths), target_frame_count):
         shutil.copy2(last_frame_path, output_dir / f"{frame_index:06d}.png")
 
-    return anchor_image, anchor_mask, str(output_dir), anchor_index
+    return str(output_dir), global_crop_box
 
 
-def run_flashvsr_super_resolution(input_dir, output_image_path, target_frame_index):
+def prepare_flashvsr_masks(mask_paths, crop_box, superres_paths, output_dir):
+    if len(mask_paths) != len(superres_paths):
+        raise ValueError(f"FlashVSR mask/output count mismatch: {len(mask_paths)} masks vs {len(superres_paths)} outputs")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_paths = []
+    for frame_index, (mask_path, superres_path) in enumerate(zip(mask_paths, superres_paths)):
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read FlashVSR mask: {mask_path}")
+        _, mask_binary = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
+        mask_image = Image.fromarray(mask_binary)
+        if crop_box is not None:
+            mask_image = mask_image.crop(crop_box)
+        with Image.open(superres_path) as superres_image:
+            mask_image = mask_image.resize(superres_image.size, Image.NEAREST)
+        output_path = output_dir / f"{frame_index:06d}.png"
+        mask_image.save(output_path)
+        output_paths.append(str(output_path))
+    return output_paths
+
+
+def run_flashvsr_super_resolution(input_dir, output_dir, num_real_frames):
     input_dir = Path(input_dir)
-    output_image_path = Path(output_image_path)
-    output_image_path.parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
     if not FLASHVSR_SCRIPT.exists():
         raise FileNotFoundError(f"FlashVSR script not found: {FLASHVSR_SCRIPT}")
     if not input_dir.is_dir():
         raise FileNotFoundError(f"FlashVSR input directory not found: {input_dir}")
+    if num_real_frames < 1:
+        raise ValueError(f"num_real_frames must be positive, got {num_real_frames}")
 
     command = [
         "conda", "run", "-n", "flashvsr", "python", str(FLASHVSR_HELPER_SCRIPT),
         "--flashvsr-script", str(FLASHVSR_SCRIPT),
         "--input-dir", str(input_dir),
-        "--output", str(output_image_path),
-        "--target-frame-index", str(target_frame_index),
+        "--output-dir", str(output_dir),
+        "--num-real-frames", str(num_real_frames),
     ]
 
     try:
@@ -497,9 +530,11 @@ def run_flashvsr_super_resolution(input_dir, output_image_path, target_frame_ind
 
     if result.stdout:
         print(result.stdout, end="")
-    if output_image_path.exists():
-        return str(output_image_path)
-    raise FileNotFoundError(f"FlashVSR finished but did not create the requested output image: {output_image_path}")
+    output_paths = [output_dir / f"{frame_index:06d}.png" for frame_index in range(num_real_frames)]
+    missing_paths = [str(path) for path in output_paths if not path.exists()]
+    if missing_paths:
+        raise FileNotFoundError(f"FlashVSR finished without creating output frames: {missing_paths}")
+    return [str(path) for path in output_paths]
 
 
 def run_sam3d_subprocess(image_path, mask_path, mesh_path, high_mesh_path, video_path, splat_path, seed):
@@ -524,8 +559,7 @@ def run_sam3d_subprocess(image_path, mask_path, mesh_path, high_mesh_path, video
     subprocess.run(command, check=True)
 
 
-def generate_3d_with_sam3d(models, image, mask, workspace, export_format="obj", seed=-1,
-                           superres_input_dir=None, superres_target_frame_index=None):
+def generate_3d_with_sam3d(models, image, mask, workspace, export_format="obj", seed=-1):
     if seed == -1:
         seed = np.random.randint(0, MAX_SEED)
 
@@ -539,23 +573,13 @@ def generate_3d_with_sam3d(models, image, mask, workspace, export_format="obj", 
     splat_path = os.path.join(model_middle_dir, f"{output_id}_splat.ply")
     sam3d_image_path = os.path.join(model_middle_dir, f"{output_id}_sam3d_input.png")
     sam3d_mask_path = os.path.join(model_middle_dir, f"{output_id}_sam3d_mask.png")
-    superres_image_path = os.path.join(model_middle_dir, f"{output_id}_sam3d_input_superres.png")
 
     image_pil = image.convert("RGB") if isinstance(image, Image.Image) else Image.fromarray(np.array(image).astype(np.uint8)).convert("RGB")
     mask_np = np.array(mask if not isinstance(mask, Image.Image) else mask.convert("L"))
     mask_np = mask_np == 188 if np.any(mask_np == 188) else mask_np > 0
     mask_pil = Image.fromarray(mask_np.astype(np.uint8) * 255)
 
-    if superres_input_dir is None or superres_target_frame_index is None:
-        raise RuntimeError("FlashVSR input sequence and target frame index are required.")
-    superres_image_path = run_flashvsr_super_resolution(
-        superres_input_dir,
-        superres_image_path,
-        superres_target_frame_index,
-    )
-    print(f"🔍 FlashVSR super-resolution applied: {superres_image_path}")
-    sam3d_image = Image.open(superres_image_path).convert("RGB")
-    sam3d_image.resize(SAM3D_INPUT_SIZE, Image.LANCZOS).save(sam3d_image_path)
+    image_pil.resize(SAM3D_INPUT_SIZE, Image.LANCZOS).save(sam3d_image_path)
     mask_pil.resize(SAM3D_INPUT_SIZE, Image.NEAREST).save(sam3d_mask_path)
     run_sam3d_subprocess(sam3d_image_path, sam3d_mask_path, mesh_path, high_mesh_path, video_path, splat_path, seed)
     return video_path, mesh_path, high_mesh_path
@@ -564,8 +588,7 @@ def generate_3d_with_sam3d(models, image, mask, workspace, export_format="obj", 
 def generate_3d(models, image, mask, workspace, export_format="obj", seed=-1,
                 ss_guidance_strength=7.5, ss_sampling_steps=12,
                 slat_guidance_strength=3, slat_sampling_steps=12,
-                is_occluded=False,
-                superres_input_dir=None, superres_target_frame_index=None):
+                is_occluded=False):
     return generate_3d_with_sam3d(
         models,
         image,
@@ -573,8 +596,6 @@ def generate_3d(models, image, mask, workspace, export_format="obj", seed=-1,
         workspace,
         export_format=export_format,
         seed=seed,
-        superres_input_dir=superres_input_dir,
-        superres_target_frame_index=superres_target_frame_index,
     )
 
 
@@ -619,7 +640,7 @@ def choose_anchor_index(mask_names):
     return best_index
 
 
-def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomize_seed=False,
+def generate_model_from_workspace(workspace, sam3d_image_path, sam3d_mask_path, anchor_index=None, seed=0, randomize_seed=False,
                                   ss_guidance_strength=7.5, ss_sampling_steps=12,
                                   slat_guidance_strength=3, slat_sampling_steps=12,
                                   is_occluded=False, crop_padding=1.2):
@@ -632,14 +653,8 @@ def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomiz
 
     model_dir = os.path.join(workspace, "model")
     os.makedirs(model_dir, exist_ok=True)
-    sequence_dir = Path(model_dir) / "middle_file" / f"flashvsr_inputs_{uuid.uuid4().hex}"
-    rgb_image, final_mask, superres_input_dir, superres_target_frame_index = prepare_flashvsr_input_sequence(
-        rgb_names,
-        mask_names,
-        anchor_index,
-        sequence_dir,
-        FLASHVSR_CROP_PADDING,
-    )
+    rgb_image = Image.open(sam3d_image_path).convert("RGB")
+    final_mask = Image.open(sam3d_mask_path).convert("L")
     final_mask.save(os.path.join(model_dir, "final_mask.png"))
 
     actual_seed = np.random.randint(0, MAX_SEED) if randomize_seed else seed
@@ -655,8 +670,6 @@ def generate_model_from_workspace(workspace, anchor_index=None, seed=0, randomiz
         slat_guidance_strength=slat_guidance_strength,
         slat_sampling_steps=slat_sampling_steps,
         is_occluded=is_occluded,
-        superres_input_dir=superres_input_dir,
-        superres_target_frame_index=superres_target_frame_index,
     )
 
 
@@ -729,11 +742,35 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
                             randomize_seed=False, ss_guidance_strength=7.5, ss_sampling_steps=12,
                             slat_guidance_strength=3, slat_sampling_steps=12, is_occluded=False, crop_padding=1.2):
     workspace = create_workspace(output_dir)
-    prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=frame_stride, max_frames=max_frames)
+    rgb_paths, mask_paths = select_input_paths(rgb_dir, mask_dir, frame_stride=frame_stride, max_frames=max_frames)
     if anchor_index is None:
-        anchor_index = choose_anchor_index(sorted_image_paths(os.path.join(workspace, "masks")))
+        anchor_index = choose_anchor_index(mask_paths)
+
+    flashvsr_dir = Path(workspace) / "flashvsr" / uuid.uuid4().hex
+    flashvsr_input_dir, global_crop_box = prepare_flashvsr_input_sequence(
+        rgb_paths,
+        mask_paths,
+        anchor_index,
+        flashvsr_dir / "inputs",
+        FLASHVSR_CROP_PADDING,
+    )
+    superres_paths = run_flashvsr_super_resolution(
+        flashvsr_input_dir,
+        flashvsr_dir / "outputs",
+        len(rgb_paths),
+    )
+    superres_mask_paths = prepare_flashvsr_masks(
+        mask_paths,
+        global_crop_box,
+        superres_paths,
+        flashvsr_dir / "masks",
+    )
+    prepare_workspace_from_paths(superres_paths, superres_mask_paths, workspace)
+
     model_video, mesh_path, high_mesh_path = generate_model_from_workspace(
         workspace,
+        sam3d_image_path=superres_paths[anchor_index],
+        sam3d_mask_path=superres_mask_paths[anchor_index],
         anchor_index=anchor_index,
         seed=seed,
         randomize_seed=randomize_seed,
@@ -760,6 +797,8 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
     pose_video, poses_json = estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path, anchor_index=anchor_index)
     outputs = {
         "workspace": workspace,
+        "flashvsr_dir": str(flashvsr_dir),
+        "flashvsr_global_crop_box": global_crop_box,
         "depth_video": depth_video,
         "model_video": model_video,
         "scaled_model_path": scaled_model_path,
