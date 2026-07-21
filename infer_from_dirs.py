@@ -119,14 +119,6 @@ def prepare_workspace_from_dirs(rgb_dir, mask_dir, workspace, frame_stride=1, ma
         if mask is None:
             raise ValueError(f"Failed to read mask: {mask_path}")
 
-        height, width = image.shape[:2]
-        scale = 336 / min(height, width)
-        if scale < 1:
-            new_height = int(height * scale)
-            new_width = int(width * scale)
-            image = cv2.resize(image, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-            mask = cv2.resize(mask, (new_width, new_height), interpolation=cv2.INTER_NEAREST)
-
         image_tensors.append(torch.from_numpy(image).permute(2, 0, 1).float())
         mask_tensors.append(torch.from_numpy((mask > 127).astype(np.float32))[None])
 
