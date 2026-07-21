@@ -355,16 +355,19 @@ def get_mask_crop_box(mask_binary, crop_padding):
     return center[0] - size // 2, center[1] - size // 2, center[0] + size // 2, center[1] + size // 2
 
 
-def crop_rgb_with_mask(rgb_path, mask_binary, crop_box, output_size=(518, 518)):
+def crop_rgb_with_mask(rgb_path, mask_binary, crop_box, output_size=(518, 518), apply_mask=True):
     input_image = Image.open(rgb_path).convert("RGB")
     if input_image.size != (mask_binary.shape[1], mask_binary.shape[0]):
         raise ValueError(
             f"RGB/mask resolution mismatch for {rgb_path}: {input_image.size} vs "
             f"{mask_binary.shape[1]}x{mask_binary.shape[0]}"
         )
-    rgb_image = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGB2BGR)
-    result_image = cv2.bitwise_and(rgb_image, rgb_image, mask=mask_binary)
-    rgb_output = Image.fromarray(cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB))
+    if apply_mask:
+        rgb_image = cv2.cvtColor(np.array(input_image), cv2.COLOR_RGB2BGR)
+        result_image = cv2.bitwise_and(rgb_image, rgb_image, mask=mask_binary)
+        rgb_output = Image.fromarray(cv2.cvtColor(result_image, cv2.COLOR_BGR2RGB))
+    else:
+        rgb_output = input_image
     mask_output = Image.fromarray(mask_binary)
     if crop_box is not None:
         rgb_output = rgb_output.crop(crop_box)
@@ -416,6 +419,7 @@ def prepare_flashvsr_input_sequence(rgb_paths, mask_paths, anchor_index, output_
             anchor_mask_binary,
             anchor_crop_box,
             output_size=None,
+            apply_mask=False,
         )
         image.save(output_dir / f"{frame_index:06d}.png")
         if frame_index == anchor_index:
