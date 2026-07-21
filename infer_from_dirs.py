@@ -48,7 +48,11 @@ FLASHVSR_SCRIPT = Path("/data/user_data/junyizh3/projects/FlashVSR/examples/WanV
 FLASHVSR_HELPER_SCRIPT = PROJECT_ROOT / "scripts" / "run_flashvsr_stage.py"
 FLASHVSR_MIN_FRAMES = 25
 FLASHVSR_CROP_PADDING = 2.0
+FLASHVSR_SCALE = 4.0
 SAM3D_INPUT_SIZE = (518, 518)
+LOCAL_POSE_MIN_CONFIDENCE = 0.5
+LOCAL_POSE_MIN_INLIERS = 6
+LOCAL_POSE_MAX_REPROJECTION_ERROR = 3.0
 
 
 
@@ -88,6 +92,23 @@ def preprocess_mask_tensor(mask_tensor, target_size=518):
     return mask_tensor
 
 
+def get_workspace_image_transform(image_size, target_size=518):
+    image_width, image_height = image_size
+    scaled_width = target_size
+    scaled_height = round(image_height * (scaled_width / image_width) / 14) * 14
+    crop_top = (scaled_height - target_size) // 2 if scaled_height > target_size else 0
+    output_height = min(scaled_height, target_size)
+    return {
+        "source_width": image_width,
+        "source_height": image_height,
+        "output_width": scaled_width,
+        "output_height": output_height,
+        "scale_x": scaled_width / image_width,
+        "scale_y": scaled_height / image_height,
+        "crop_top": crop_top,
+    }
+
+
 def select_input_paths(rgb_dir, mask_dir, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE):
     rgb_paths = sorted_image_paths(rgb_dir)
     mask_paths = sorted_image_paths(mask_dir)
@@ -117,6 +138,7 @@ def prepare_workspace_from_paths(rgb_paths, mask_paths, workspace):
 
     image_tensors = []
     mask_tensors = []
+    image_transforms = {}
     for rgb_path, mask_path in zip(rgb_paths, mask_paths):
         image = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
         if image is None:
@@ -127,6 +149,8 @@ def prepare_workspace_from_paths(rgb_paths, mask_paths, workspace):
         if mask is None:
             raise ValueError(f"Failed to read mask: {mask_path}")
 
+        frame_id = len(image_tensors)
+        image_transforms[str(frame_id)] = get_workspace_image_transform((image.shape[1], image.shape[0]))
         image_tensors.append(torch.from_numpy(image).permute(2, 0, 1).float())
         mask_tensors.append(torch.from_numpy((mask > 127).astype(np.float32))[None])
 
@@ -138,6 +162,8 @@ def prepare_workspace_from_paths(rgb_paths, mask_paths, workspace):
         mask_image = (mask.squeeze(0).cpu().numpy() > 0.5).astype(np.uint8) * 255
         cv2.imwrite(str(out_mask_dir / f"{frame_id:06d}.png"), mask_image)
 
+    with open(workspace / "image_transforms.json", "w") as f:
+        json.dump(image_transforms, f, indent=2)
     return str(out_rgb_dir), str(out_mask_dir)
 
 
@@ -470,6 +496,46 @@ def prepare_flashvsr_input_sequence(rgb_paths, mask_paths, anchor_index, output_
     return str(output_dir), global_crop_box
 
 
+def get_flashvsr_crop_geometry(image_size, crop_box, superres_size, scale=FLASHVSR_SCALE):
+    image_width, image_height = image_size
+    if crop_box is None:
+        crop_box = (0, 0, image_width, image_height)
+    left, top, right, bottom = crop_box
+    crop_width = right - left
+    crop_height = bottom - top
+    if crop_width <= 0 or crop_height <= 0:
+        raise ValueError(f"Invalid FlashVSR crop box: {crop_box}")
+
+    scaled_crop_width = int(round(crop_width * scale))
+    scaled_crop_height = int(round(crop_height * scale))
+    superres_width, superres_height = superres_size
+    if superres_width > scaled_crop_width or superres_height > scaled_crop_height:
+        raise ValueError(
+            f"FlashVSR output {superres_size} exceeds scaled crop "
+            f"{scaled_crop_width}x{scaled_crop_height}"
+        )
+
+    offset_x = (scaled_crop_width - superres_width) // 2
+    offset_y = (scaled_crop_height - superres_height) // 2
+    output_width = int(round(superres_width / scale))
+    output_height = int(round(superres_height / scale))
+    paste_left = int(round(left + offset_x / scale))
+    paste_top = int(round(top + offset_y / scale))
+    paste_right = paste_left + output_width
+    paste_bottom = paste_top + output_height
+    if paste_left < 0 or paste_top < 0 or paste_right > image_width or paste_bottom > image_height:
+        raise ValueError(
+            f"FlashVSR output box {(paste_left, paste_top, paste_right, paste_bottom)} "
+            f"falls outside source image size {image_size}"
+        )
+    return (
+        crop_box,
+        (scaled_crop_width, scaled_crop_height),
+        (offset_x, offset_y, offset_x + superres_width, offset_y + superres_height),
+        (paste_left, paste_top, paste_right, paste_bottom),
+    )
+
+
 def prepare_flashvsr_masks(mask_paths, crop_box, superres_paths, output_dir):
     if len(mask_paths) != len(superres_paths):
         raise ValueError(f"FlashVSR mask/output count mismatch: {len(mask_paths)} masks vs {len(superres_paths)} outputs")
@@ -482,15 +548,243 @@ def prepare_flashvsr_masks(mask_paths, crop_box, superres_paths, output_dir):
         if mask is None:
             raise ValueError(f"Failed to read FlashVSR mask: {mask_path}")
         _, mask_binary = cv2.threshold(mask, 1, 255, cv2.THRESH_BINARY)
-        mask_image = Image.fromarray(mask_binary)
-        if crop_box is not None:
-            mask_image = mask_image.crop(crop_box)
         with Image.open(superres_path) as superres_image:
-            mask_image = mask_image.resize(superres_image.size, Image.NEAREST)
+            source_crop_box, scaled_crop_size, superres_crop_box, _ = get_flashvsr_crop_geometry(
+                (mask.shape[1], mask.shape[0]),
+                crop_box,
+                superres_image.size,
+            )
+        mask_image = Image.fromarray(mask_binary).crop(source_crop_box)
+        mask_image = mask_image.resize(scaled_crop_size, Image.NEAREST).crop(superres_crop_box)
         output_path = output_dir / f"{frame_index:06d}.png"
         mask_image.save(output_path)
         output_paths.append(str(output_path))
     return output_paths
+
+
+def reproject_flashvsr_sequence(rgb_paths, mask_paths, superres_paths, crop_box, output_dir):
+    if not (len(rgb_paths) == len(mask_paths) == len(superres_paths)):
+        raise ValueError(
+            "FlashVSR reprojection requires equal RGB, mask, and output counts: "
+            f"{len(rgb_paths)}, {len(mask_paths)}, {len(superres_paths)}"
+        )
+
+    output_dir = Path(output_dir)
+    output_rgb_dir = output_dir / "rgb"
+    output_mask_dir = output_dir / "masks"
+    output_rgb_dir.mkdir(parents=True, exist_ok=True)
+    output_mask_dir.mkdir(parents=True, exist_ok=True)
+    output_rgb_paths = []
+    output_mask_paths = []
+
+    for frame_index, (rgb_path, mask_path, superres_path) in enumerate(zip(rgb_paths, mask_paths, superres_paths)):
+        with Image.open(rgb_path).convert("RGB") as image:
+            source_image = image.copy()
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if mask is None:
+            raise ValueError(f"Failed to read FlashVSR mask: {mask_path}")
+        if source_image.size != (mask.shape[1], mask.shape[0]):
+            raise ValueError(
+                f"RGB/mask resolution mismatch for {rgb_path}: {source_image.size} vs "
+                f"{mask.shape[1]}x{mask.shape[0]}"
+            )
+
+        with Image.open(superres_path).convert("RGB") as image:
+            superres_image = image.copy()
+        _, _, _, paste_box = get_flashvsr_crop_geometry(
+            source_image.size,
+            crop_box,
+            superres_image.size,
+        )
+        local_image = superres_image.resize(
+            (paste_box[2] - paste_box[0], paste_box[3] - paste_box[1]),
+            Image.LANCZOS,
+        )
+        full_image = source_image.copy()
+        full_image.paste(local_image, paste_box[:2])
+        full_mask = Image.fromarray((mask > 127).astype(np.uint8) * 255)
+
+        rgb_output_path = output_rgb_dir / f"{frame_index:06d}.png"
+        mask_output_path = output_mask_dir / f"{frame_index:06d}.png"
+        full_image.save(rgb_output_path)
+        full_mask.save(mask_output_path)
+        output_rgb_paths.append(str(rgb_output_path))
+        output_mask_paths.append(str(mask_output_path))
+
+    return output_rgb_paths, output_mask_paths
+
+
+def map_flashvsr_points_to_original(points, image_size, crop_box, superres_size):
+    source_crop_box, _, superres_crop_box, _ = get_flashvsr_crop_geometry(
+        image_size,
+        crop_box,
+        superres_size,
+    )
+    mapped_points = np.asarray(points, dtype=np.float32).copy()
+    mapped_points[..., 0] = source_crop_box[0] + (mapped_points[..., 0] + superres_crop_box[0]) / FLASHVSR_SCALE
+    mapped_points[..., 1] = source_crop_box[1] + (mapped_points[..., 1] + superres_crop_box[1]) / FLASHVSR_SCALE
+    mapped_points[..., 0] = np.clip(mapped_points[..., 0], 0, image_size[0] - 1)
+    mapped_points[..., 1] = np.clip(mapped_points[..., 1], 0, image_size[1] - 1)
+    return mapped_points
+
+
+def map_original_points_to_workspace(points, image_transform):
+    mapped_points = np.asarray(points, dtype=np.float32).copy()
+    mapped_points[..., 0] *= image_transform["scale_x"]
+    mapped_points[..., 1] = mapped_points[..., 1] * image_transform["scale_y"] - image_transform["crop_top"]
+    valid = (
+        (mapped_points[..., 0] >= 0)
+        & (mapped_points[..., 0] < image_transform["output_width"])
+        & (mapped_points[..., 1] >= 0)
+        & (mapped_points[..., 1] < image_transform["output_height"])
+    )
+    return mapped_points, valid
+
+
+def run_flashvsr_local_matching(models, workspace, local_rgb_dir, local_mask_dir, image_size, crop_box,
+                                grid_size=50, vo_points=756, mode="offline", anchor_index=0):
+    local_rgb_paths = sorted_image_paths(local_rgb_dir)
+    local_mask_paths = sorted_image_paths(local_mask_dir)
+    if len(local_rgb_paths) != len(local_mask_paths):
+        raise ValueError(
+            f"FlashVSR local RGB/mask count mismatch: {len(local_rgb_paths)} RGB frames vs "
+            f"{len(local_mask_paths)} masks"
+        )
+    if not local_rgb_paths:
+        raise ValueError("No FlashVSR local frames were provided for matching")
+    if not 0 <= anchor_index < len(local_rgb_paths):
+        raise ValueError(f"anchor_index {anchor_index} is out of range for FlashVSR local frames")
+
+    output_dir = Path(workspace) / "results" / "flashvsr_local"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tracker_model = models.tracker_model_offline if mode == "offline" else models.tracker_model_online
+    tracker_model, tracker_viser = get_tracker_predictor(
+        str(output_dir),
+        vo_points=vo_points,
+        tracker_model=tracker_model.cuda(),
+    )
+
+    video_tensor = load_prepared_rgb_tensor(local_rgb_dir)
+    with torch.no_grad(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        predictions = models.vggt4track_model(video_tensor[None].cuda() / 255)
+        extrinsic = predictions["poses_pred"]
+        intrinsic = predictions["intrs"]
+        depth_map = predictions["points_map"][..., 2]
+        depth_conf = predictions["unc_metric"]
+
+    depth_tensor = depth_map.squeeze().cpu().numpy()
+    extrs = extrinsic.squeeze().cpu().numpy()
+    intrs = intrinsic.squeeze().cpu().numpy()
+    unc_metric = depth_conf.squeeze().cpu().numpy() > 0.5
+
+    mask_path = local_mask_paths[anchor_index]
+    mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise ValueError(f"Failed to read FlashVSR local mask: {mask_path}")
+    frame_height, frame_width = video_tensor.shape[2:]
+    mask = cv2.resize(mask, (frame_width, frame_height), interpolation=cv2.INTER_NEAREST) > 127
+    grid_pts = get_points_on_a_grid(grid_size, (frame_height, frame_width), device="cuda")
+    grid_pts_int = grid_pts[0].long()
+    mask_values = mask[grid_pts_int.cpu()[..., 1], grid_pts_int.cpu()[..., 0]]
+    grid_pts = grid_pts[:, mask_values]
+    if grid_pts.shape[1] == 0:
+        raise ValueError(
+            f"No FlashVSR local query points sampled from anchor_index={anchor_index} mask {mask_path}. "
+            "Increase --grid-size or check the FlashVSR mask alignment."
+        )
+    query_t = torch.ones_like(grid_pts[:, :, :1]) * anchor_index
+    query_xyt = torch.cat([query_t, grid_pts], dim=2)[0].cpu().numpy()
+
+    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+        (
+            _, local_intrs, _, local_conf_depth,
+            _, track2d_pred, vis_pred, conf_pred, video,
+        ) = tracker_model.forward(
+            video_tensor,
+            depth=depth_tensor,
+            intrs=intrs,
+            extrs=extrs,
+            queries=query_xyt,
+            fps=1,
+            full_point=False,
+            iters_track=4,
+            query_no_BA=True,
+            fixed_cam=False,
+            stage=1,
+            unc_metric=unc_metric,
+            support_frame=len(video_tensor) - 1,
+            replace_ratio=0.2,
+        )
+        tracker_viser.visualize(
+            video=video[None],
+            tracks=track2d_pred[None][..., :2],
+            visibility=vis_pred[None],
+            filename="flashvsr_local",
+            query_frame=anchor_index,
+        )
+
+    local_tracks = track2d_pred[..., :2].cpu().numpy()
+    original_tracks = map_flashvsr_points_to_original(
+        local_tracks,
+        image_size,
+        crop_box,
+        (frame_width, frame_height),
+    )
+    local_queries = query_xyt[:, 1:]
+    original_queries = map_flashvsr_points_to_original(
+        local_queries,
+        image_size,
+        crop_box,
+        (frame_width, frame_height),
+    )
+    transforms_path = Path(workspace) / "image_transforms.json"
+    if not transforms_path.is_file():
+        raise FileNotFoundError(f"Workspace image transforms not found: {transforms_path}")
+    with open(transforms_path) as f:
+        image_transforms = json.load(f)
+    if len(image_transforms) != len(local_tracks):
+        raise ValueError(
+            f"Workspace/local track frame count mismatch: {len(image_transforms)} transforms vs "
+            f"{len(local_tracks)} local track frames"
+        )
+    workspace_tracks = np.empty_like(original_tracks)
+    workspace_track_valid = np.empty(original_tracks.shape[:2], dtype=bool)
+    for frame_index in range(len(original_tracks)):
+        workspace_tracks[frame_index], workspace_track_valid[frame_index] = map_original_points_to_workspace(
+            original_tracks[frame_index],
+            image_transforms[str(frame_index)],
+        )
+    workspace_queries, workspace_query_valid = map_original_points_to_workspace(
+        original_queries,
+        image_transforms[str(anchor_index)],
+    )
+    source_crop_box, _, superres_crop_box, _ = get_flashvsr_crop_geometry(
+        image_size,
+        crop_box,
+        (frame_width, frame_height),
+    )
+    output_path = output_dir / "tracks_original.npz"
+    np.savez(
+        output_path,
+        tracks_local=local_tracks,
+        tracks_original=original_tracks,
+        tracks_workspace=workspace_tracks,
+        tracks_workspace_valid=workspace_track_valid,
+        queries_local=local_queries,
+        queries_original=original_queries,
+        queries_workspace=workspace_queries,
+        queries_workspace_valid=workspace_query_valid,
+        visibs=vis_pred.cpu().numpy(),
+        confs=conf_pred.cpu().numpy(),
+        confs_depth=local_conf_depth.cpu().numpy(),
+        intrinsics_local=local_intrs.cpu().numpy(),
+        source_crop_box=np.asarray(source_crop_box, dtype=np.float32),
+        superres_crop_box=np.asarray(superres_crop_box, dtype=np.float32),
+        original_image_size=np.asarray(image_size, dtype=np.int32),
+        superres_image_size=np.asarray((frame_width, frame_height), dtype=np.int32),
+    )
+    print(f"Saved FlashVSR local tracks mapped to original coordinates: {output_path}")
+    return str(output_path)
 
 
 def run_flashvsr_super_resolution(input_dir, output_dir, num_real_frames):
@@ -737,12 +1031,253 @@ def estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_
     return normal_video_path_new, poses_file_path
 
 
+def sample_depth_at_points(depth_map, points):
+    height, width = depth_map.shape
+    points = np.asarray(points, dtype=np.float32)
+    x0 = np.floor(points[:, 0]).astype(np.int32)
+    y0 = np.floor(points[:, 1]).astype(np.int32)
+    x1 = x0 + 1
+    y1 = y0 + 1
+    valid = (x0 >= 0) & (y0 >= 0) & (x1 < width) & (y1 < height)
+    values = np.zeros(len(points), dtype=np.float32)
+    if not np.any(valid):
+        return values, valid
+
+    valid_indices = np.where(valid)[0]
+    x0_valid = x0[valid]
+    y0_valid = y0[valid]
+    x1_valid = x1[valid]
+    y1_valid = y1[valid]
+    dx = points[valid, 0] - x0_valid
+    dy = points[valid, 1] - y0_valid
+    values[valid_indices] = (
+        depth_map[y0_valid, x0_valid] * (1 - dx) * (1 - dy)
+        + depth_map[y0_valid, x1_valid] * dx * (1 - dy)
+        + depth_map[y1_valid, x0_valid] * (1 - dx) * dy
+        + depth_map[y1_valid, x1_valid] * dx * dy
+    )
+    return values, valid
+
+
+def sample_mask_at_points(mask, points):
+    height, width = mask.shape
+    points = np.asarray(points, dtype=np.float32)
+    x = np.rint(points[:, 0]).astype(np.int32)
+    y = np.rint(points[:, 1]).astype(np.int32)
+    valid = (x >= 0) & (y >= 0) & (x < width) & (y < height)
+    values = np.zeros(len(points), dtype=bool)
+    values[valid] = mask[y[valid], x[valid]] > 127
+    return values
+
+
+def unproject_points(points, depths, intrinsics):
+    homogeneous_points = np.column_stack([points, np.ones(len(points), dtype=np.float32)])
+    rays = (np.linalg.inv(intrinsics) @ homogeneous_points.T).T
+    return rays * depths[:, None]
+
+
+def create_pose_matrix(rotation_vector, translation_vector):
+    rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = rotation_matrix
+    pose[:3, 3] = translation_vector.reshape(3)
+    return pose
+
+
+def render_pose_video_from_workspace(workspace, poses, high_mesh_path, filename):
+    pose_dir = Path(workspace) / "pose_result"
+    pose_dir.mkdir(parents=True, exist_ok=True)
+    rgb_names = sorted_image_paths(Path(workspace) / "rgb")
+    with open(Path(workspace) / "intrinsics.json") as f:
+        intrinsics_dict = json.load(f)
+    intrinsics = [intrinsics_dict[str(frame_id)] for frame_id in range(len(rgb_names))]
+    intermediate_video_path = pose_dir / f"{filename}.mp4"
+    output_video_path = pose_dir / f"{filename}_new.mp4"
+    render_high_model_to_normal_video(
+        poses,
+        rgb_names,
+        intrinsics,
+        high_mesh_path,
+        str(intermediate_video_path),
+        fps=VIDEO_FPS,
+        device="cuda",
+    )
+    convert_video_to_mp4(str(intermediate_video_path), str(output_video_path))
+    os.remove(intermediate_video_path)
+    return str(output_video_path)
+
+
+def refine_poses_with_flashvsr_tracks(workspace, local_tracks_path, foundation_poses_path, anchor_index=0):
+    local_tracks = np.load(local_tracks_path)
+    tracks = local_tracks["tracks_workspace"]
+    track_valid = local_tracks["tracks_workspace_valid"].astype(bool)
+    visibility = local_tracks["visibs"]
+    confidence = local_tracks["confs"]
+    if visibility.ndim == 3:
+        visibility = visibility[..., 0]
+    if confidence.ndim == 3:
+        confidence = confidence[..., 0]
+
+    with open(foundation_poses_path) as f:
+        foundation_pose_dict = json.load(f)
+    frame_count, point_count, _ = tracks.shape
+    if not 0 <= anchor_index < frame_count:
+        raise ValueError(f"anchor_index {anchor_index} is out of range for {frame_count} FlashVSR track frames")
+    foundation_poses = [np.asarray(foundation_pose_dict[str(frame_id)], dtype=np.float64) for frame_id in range(frame_count)]
+
+    depth_paths = sorted_image_paths(Path(workspace) / "depth")
+    mask_paths = sorted_image_paths(Path(workspace) / "masks")
+    if len(depth_paths) != frame_count or len(mask_paths) != frame_count:
+        raise ValueError(
+            f"Workspace/depth/mask frame count mismatch: tracks={frame_count}, "
+            f"depth={len(depth_paths)}, masks={len(mask_paths)}"
+        )
+    with open(Path(workspace) / "intrinsics.json") as f:
+        intrinsics_dict = json.load(f)
+    intrinsics = [np.asarray(intrinsics_dict[str(frame_id)], dtype=np.float64) for frame_id in range(frame_count)]
+
+    anchor_depth = cv2.imread(depth_paths[anchor_index], cv2.IMREAD_UNCHANGED)
+    anchor_mask = cv2.imread(mask_paths[anchor_index], cv2.IMREAD_GRAYSCALE)
+    if anchor_depth is None or anchor_mask is None:
+        raise ValueError("Failed to read anchor depth or mask for FlashVSR pose refinement")
+    anchor_depth = anchor_depth.astype(np.float32) / 1000
+    anchor_points = tracks[anchor_index]
+    anchor_depth_values, anchor_depth_valid = sample_depth_at_points(anchor_depth, anchor_points)
+    anchor_valid = (
+        track_valid[anchor_index]
+        & (visibility[anchor_index] * confidence[anchor_index] >= LOCAL_POSE_MIN_CONFIDENCE)
+        & anchor_depth_valid
+        & (anchor_depth_values > 0)
+        & sample_mask_at_points(anchor_mask, anchor_points)
+    )
+
+    anchor_indices = np.where(anchor_valid)[0]
+    refinement_dir = Path(workspace) / "pose_result"
+    refinement_dir.mkdir(parents=True, exist_ok=True)
+    refined_poses_path = refinement_dir / "poses_flashvsr_refined.json"
+    stats_path = refinement_dir / "flashvsr_pnp_stats.json"
+    if len(anchor_indices) < LOCAL_POSE_MIN_INLIERS:
+        refined_poses = foundation_poses
+        stats = {
+            str(frame_id): {"status": "fallback_insufficient_anchor_points"}
+            for frame_id in range(frame_count)
+        }
+    else:
+        anchor_camera_points = unproject_points(
+            anchor_points[anchor_indices],
+            anchor_depth_values[anchor_indices],
+            intrinsics[anchor_index],
+        )
+        anchor_object_points = (
+            np.linalg.inv(foundation_poses[anchor_index])
+            @ np.column_stack([anchor_camera_points, np.ones(len(anchor_camera_points))]).T
+        ).T[:, :3]
+        refined_poses = []
+        stats = {}
+        for frame_index in range(frame_count):
+            if frame_index == anchor_index:
+                refined_poses.append(foundation_poses[frame_index])
+                stats[str(frame_index)] = {
+                    "status": "anchor_foundationpose",
+                    "candidate_count": int(len(anchor_indices)),
+                }
+                continue
+
+            frame_mask = cv2.imread(mask_paths[frame_index], cv2.IMREAD_GRAYSCALE)
+            if frame_mask is None:
+                raise ValueError(f"Failed to read mask for FlashVSR pose refinement: {mask_paths[frame_index]}")
+            frame_points = tracks[frame_index, anchor_indices]
+            frame_valid = (
+                track_valid[frame_index, anchor_indices]
+                & (visibility[frame_index, anchor_indices] * confidence[frame_index, anchor_indices] >= LOCAL_POSE_MIN_CONFIDENCE)
+                & sample_mask_at_points(frame_mask, frame_points)
+            )
+            object_points = anchor_object_points[frame_valid].astype(np.float64)
+            image_points = frame_points[frame_valid].astype(np.float64)
+            candidate_count = len(object_points)
+            if candidate_count < LOCAL_POSE_MIN_INLIERS:
+                refined_poses.append(foundation_poses[frame_index])
+                stats[str(frame_index)] = {
+                    "status": "fallback_insufficient_matches",
+                    "candidate_count": int(candidate_count),
+                }
+                continue
+
+            success, rotation_vector, translation_vector, inliers = cv2.solvePnPRansac(
+                object_points,
+                image_points,
+                intrinsics[frame_index],
+                None,
+                iterationsCount=1000,
+                reprojectionError=LOCAL_POSE_MAX_REPROJECTION_ERROR,
+                confidence=0.999,
+                flags=cv2.SOLVEPNP_EPNP,
+            )
+            inlier_count = 0 if inliers is None else len(inliers)
+            if not success or inlier_count < LOCAL_POSE_MIN_INLIERS:
+                refined_poses.append(foundation_poses[frame_index])
+                stats[str(frame_index)] = {
+                    "status": "fallback_pnp_failed",
+                    "candidate_count": int(candidate_count),
+                    "inlier_count": int(inlier_count),
+                }
+                continue
+
+            inlier_indices = inliers.reshape(-1)
+            if hasattr(cv2, "solvePnPRefineLM"):
+                rotation_vector, translation_vector = cv2.solvePnPRefineLM(
+                    object_points[inlier_indices],
+                    image_points[inlier_indices],
+                    intrinsics[frame_index],
+                    None,
+                    rotation_vector,
+                    translation_vector,
+                )
+            projected_points, _ = cv2.projectPoints(
+                object_points[inlier_indices],
+                rotation_vector,
+                translation_vector,
+                intrinsics[frame_index],
+                None,
+            )
+            reprojection_errors = np.linalg.norm(
+                projected_points.reshape(-1, 2) - image_points[inlier_indices],
+                axis=1,
+            )
+            median_error = float(np.median(reprojection_errors))
+            if median_error > LOCAL_POSE_MAX_REPROJECTION_ERROR:
+                refined_poses.append(foundation_poses[frame_index])
+                stats[str(frame_index)] = {
+                    "status": "fallback_high_reprojection_error",
+                    "candidate_count": int(candidate_count),
+                    "inlier_count": int(inlier_count),
+                    "median_reprojection_error": median_error,
+                }
+                continue
+
+            refined_poses.append(create_pose_matrix(rotation_vector, translation_vector))
+            stats[str(frame_index)] = {
+                "status": "refined",
+                "candidate_count": int(candidate_count),
+                "inlier_count": int(inlier_count),
+                "median_reprojection_error": median_error,
+            }
+
+    with open(refined_poses_path, "w") as f:
+        json.dump({str(frame_id): pose.tolist() for frame_id, pose in enumerate(refined_poses)}, f, indent=2)
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    return str(refined_poses_path), str(stats_path), refined_poses
+
+
 def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, max_frames=MAX_FRAMES_OFFLINE,
                             grid_size=50, vo_points=756, mode="offline", anchor_index=None, seed=0,
                             randomize_seed=False, ss_guidance_strength=7.5, ss_sampling_steps=12,
                             slat_guidance_strength=3, slat_sampling_steps=12, is_occluded=False, crop_padding=1.2):
     workspace = create_workspace(output_dir)
     rgb_paths, mask_paths = select_input_paths(rgb_dir, mask_dir, frame_stride=frame_stride, max_frames=max_frames)
+    with Image.open(rgb_paths[0]) as image:
+        original_image_size = image.size
     if anchor_index is None:
         anchor_index = choose_anchor_index(mask_paths)
 
@@ -765,7 +1300,14 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         superres_paths,
         flashvsr_dir / "masks",
     )
-    prepare_workspace_from_paths(superres_paths, superres_mask_paths, workspace)
+    full_superres_paths, full_superres_mask_paths = reproject_flashvsr_sequence(
+        rgb_paths,
+        mask_paths,
+        superres_paths,
+        global_crop_box,
+        flashvsr_dir / "reprojected",
+    )
+    prepare_workspace_from_paths(full_superres_paths, full_superres_mask_paths, workspace)
 
     model_video, mesh_path, high_mesh_path = generate_model_from_workspace(
         workspace,
@@ -787,6 +1329,18 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
 
     models = DirInferenceModels()
     depth_video = run_tracker_from_workspace(models, workspace, grid_size=grid_size, vo_points=vo_points, mode=mode, anchor_index=anchor_index)
+    flashvsr_local_tracks = run_flashvsr_local_matching(
+        models,
+        workspace,
+        flashvsr_dir / "outputs",
+        flashvsr_dir / "masks",
+        original_image_size,
+        global_crop_box,
+        grid_size=grid_size,
+        vo_points=vo_points,
+        mode=mode,
+        anchor_index=anchor_index,
+    )
     del models
     gc.collect()
     if torch.cuda.is_available():
@@ -794,17 +1348,39 @@ def run_inference_from_dirs(rgb_dir, mask_dir, output_dir=None, frame_stride=1, 
         torch.cuda.ipc_collect()
 
     scaled_model_path, high_mesh_path = rescale_model_from_workspace(workspace, anchor_index, mesh_path, high_mesh_path, crop_padding=crop_padding)
-    pose_video, poses_json = estimate_query_poses_from_workspace(workspace, scaled_model_path, high_mesh_path, anchor_index=anchor_index)
+    foundationpose_video, foundationpose_poses_json = estimate_query_poses_from_workspace(
+        workspace,
+        scaled_model_path,
+        high_mesh_path,
+        anchor_index=anchor_index,
+    )
+    poses_json, flashvsr_pnp_stats, refined_poses = refine_poses_with_flashvsr_tracks(
+        workspace,
+        flashvsr_local_tracks,
+        foundationpose_poses_json,
+        anchor_index=anchor_index,
+    )
+    pose_video = render_pose_video_from_workspace(
+        workspace,
+        refined_poses,
+        high_mesh_path,
+        "normal_video_flashvsr_refined",
+    )
     outputs = {
         "workspace": workspace,
         "flashvsr_dir": str(flashvsr_dir),
         "flashvsr_global_crop_box": global_crop_box,
+        "flashvsr_reprojected_rgb_dir": str(flashvsr_dir / "reprojected" / "rgb"),
+        "flashvsr_local_tracks": flashvsr_local_tracks,
         "depth_video": depth_video,
         "model_video": model_video,
         "scaled_model_path": scaled_model_path,
         "high_mesh_path": high_mesh_path,
         "pose_video": pose_video,
         "poses_json": poses_json,
+        "foundationpose_pose_video": foundationpose_video,
+        "foundationpose_poses_json": foundationpose_poses_json,
+        "flashvsr_pnp_stats": flashvsr_pnp_stats,
         "tracking_npz": os.path.join(workspace, "results", "result.npz"),
         "anchor_index": anchor_index,
     }
