@@ -40,15 +40,6 @@ def crop_object_with_mask(image_path, mask_path, crop_padding=1.2, return_crop_b
     # 获取最大的轮廓（假设物体是最大的区域）
     largest_contour = max(contours, key=cv2.contourArea)
 
-    # 创建一个与原图大小相同的空白掩码
-    result_mask = np.zeros_like(mask)
-
-    # 在空白掩码上绘制找到的轮廓
-    cv2.drawContours(result_mask, [largest_contour], -1, (255), thickness=cv2.FILLED)
-
-    # 使用掩码从原图中提取物体
-    cropped_image = cv2.bitwise_and(image, image, mask=result_mask)
-
     # 计算最大轮廓的边界框
     x, y, w, h = cv2.boundingRect(largest_contour)
 
@@ -60,7 +51,7 @@ def crop_object_with_mask(image_path, mask_path, crop_padding=1.2, return_crop_b
     y1 = max(0, int(center_y - size / 2))
     x2 = min(image.shape[1], int(center_x + size / 2))
     y2 = min(image.shape[0], int(center_y + size / 2))
-    cropped_object = cropped_image[y1:y2, x1:x2]
+    cropped_object = image[y1:y2, x1:x2]
 
     if return_crop_box:
         return cropped_object, (x1, y1, x2, y2)
@@ -300,15 +291,16 @@ def get_matched_superglue_points(match_result):
     )
 
 
-def get_matched_sift_points(render_image, reference_image, max_keypoints=4096, ratio_threshold=0.8):
+def get_matched_sift_points(render_image, reference_image, render_mask=None, reference_mask=None,
+                            max_keypoints=4096, ratio_threshold=0.8):
     if not hasattr(cv2, 'SIFT_create'):
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     render_image = clahe.apply(render_image)
     reference_image = clahe.apply(reference_image)
     detector = cv2.SIFT_create(nfeatures=max_keypoints)
-    render_keypoints, render_descriptors = detector.detectAndCompute(render_image, None)
-    reference_keypoints, reference_descriptors = detector.detectAndCompute(reference_image, None)
+    render_keypoints, render_descriptors = detector.detectAndCompute(render_image, render_mask)
+    reference_keypoints, reference_descriptors = detector.detectAndCompute(reference_image, reference_mask)
     if render_descriptors is None or reference_descriptors is None:
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
     knn_matches = cv2.BFMatcher(cv2.NORM_L2).knnMatch(render_descriptors, reference_descriptors, k=2)
@@ -332,10 +324,25 @@ def get_matched_sift_points(render_image, reference_image, max_keypoints=4096, r
     )
 
 
-def get_valid_render_matches(render_points, reference_points, depth, camera_intrinsics, camera_pose, ref_crop_box, ref_image_shape):
+def get_valid_render_matches(render_points, reference_points, depth, camera_intrinsics, camera_pose,
+                             ref_crop_box, ref_image_shape, reference_mask=None):
     world_points, valid_mask = project_2d_to_3d(render_points, depth, camera_intrinsics, camera_pose)
     render_points = render_points[valid_mask]
     reference_points = reference_points[valid_mask]
+    if reference_mask is not None and len(reference_points):
+        point_x = np.rint(reference_points[:, 0]).astype(np.int32)
+        point_y = np.rint(reference_points[:, 1]).astype(np.int32)
+        foreground = (
+            (point_x >= 0)
+            & (point_y >= 0)
+            & (point_x < reference_mask.shape[1])
+            & (point_y < reference_mask.shape[0])
+        )
+        in_bounds = np.where(foreground)[0]
+        foreground[in_bounds] = reference_mask[point_y[in_bounds], point_x[in_bounds]] > 0
+        world_points = world_points[foreground]
+        render_points = render_points[foreground]
+        reference_points = reference_points[foreground]
     crop_width = ref_crop_box[2] - ref_crop_box[0]
     crop_height = ref_crop_box[3] - ref_crop_box[1]
     scale_x = crop_width / ref_image_shape[1]
@@ -395,13 +402,19 @@ def fit_plane(pcd, filter_z=1, distance_threshold=0.002):
     field_of_view = np.array([min_x, min_y, max_x, max_y])
     return plane_model, field_of_view
 
-def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, num_samples=8, num_ups=1, sample_flag = 0, input_pose = np.eye(4)):
+def estimate_pose(mesh_file, pcd_file, ref_img, ref_mask, raw_img, ref_crop_box, out_dir,
+                  num_samples=8, num_ups=1, sample_flag=0, input_pose=np.eye(4)):
     # load 
     device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
     mesh = trimesh.load(mesh_file)
     ref_img = cv2.imread(ref_img, cv2.IMREAD_GRAYSCALE)
+    ref_mask = cv2.imread(ref_mask, cv2.IMREAD_GRAYSCALE)
     raw_img = cv2.imread(raw_img)
     raw_img = cv2.cvtColor(raw_img, cv2.COLOR_BGR2RGB)
+    if ref_img is None or ref_mask is None:
+        raise ValueError("Failed to read scale-recovery reference image or mask")
+    if ref_img.shape != ref_mask.shape:
+        raise ValueError(f"Scale-recovery reference/mask shape mismatch: {ref_img.shape} vs {ref_mask.shape}")
     # pcd = o3d.io.read_point_cloud(pcd_file)
     pcd = pcd_file #gengzheng : correct
     plane_model, field_of_view = fit_plane(pcd, 1, 0.002)
@@ -422,7 +435,7 @@ def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, 
                                                                           raw_img.shape[1],
                                                                           raw_img.shape[0], fov, radius=radius,
                                                                           num_samples=num_samples, num_ups=num_ups, device=device, sample_flag=sample_flag, input_pose=input_pose)
-    grays = [cv2.cvtColor(color, cv2.COLOR_BGR2GRAY) for color in colors]
+    grays = [cv2.cvtColor(color, cv2.COLOR_RGB2GRAY) for color in colors]
     print('matching features...')
     _, _, match_results, _ = image_pair_matching(
         grays,
@@ -431,6 +444,7 @@ def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, 
         resize=[-1],
         viz=False,
         save=False,
+        cache=False,
         max_keypoints=2048,
         keypoint_threshold=0.0005,
         match_threshold=0.005,
@@ -441,7 +455,12 @@ def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, 
     for pose_index, match_result in enumerate(match_results):
         candidate_pose = camera_poses[pose_index].cpu().numpy()
         superglue_render_points, superglue_reference_points = get_matched_superglue_points(match_result)
-        sift_render_points, sift_reference_points = get_matched_sift_points(grays[pose_index], ref_img)
+        sift_render_points, sift_reference_points = get_matched_sift_points(
+            grays[pose_index],
+            ref_img,
+            render_mask=(depths[pose_index] > 0).astype(np.uint8) * 255,
+            reference_mask=ref_mask,
+        )
         render_points = np.concatenate([superglue_render_points, sift_render_points], axis=0)
         reference_points = np.concatenate([superglue_reference_points, sift_reference_points], axis=0)
         world_points, raw_points, valid_render_points = get_valid_render_matches(
@@ -452,6 +471,7 @@ def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, 
             candidate_pose,
             ref_crop_box,
             ref_img.shape,
+            reference_mask=ref_mask,
         )
         pnp_success = False
         rotation_vector = None
@@ -482,6 +502,8 @@ def estimate_pose(mesh_file, pcd_file, ref_img, raw_img, ref_crop_box, out_dir, 
         })
         matching_stats.append({
             "pose_index": pose_index,
+            "superglue_render_keypoint_count": int(len(match_result['keypoints0'])),
+            "superglue_reference_keypoint_count": int(len(match_result['keypoints1'])),
             "superglue_match_count": int(len(superglue_render_points)),
             "sift_match_count": int(len(sift_render_points)),
             "valid_3d_match_count": int(len(world_points)),
@@ -657,12 +679,20 @@ def get_scale(mesh, depth_file, raw_img, mask_file, out_dir, intrinsic_file, sam
         crop_padding=crop_padding,
         return_crop_box=True,
     )
+    mask = cv2.imread(mask_file, cv2.IMREAD_GRAYSCALE)
+    if mask is None:
+        raise ValueError(f"Failed to read mask: {mask_file}")
+    x1, y1, x2, y2 = ref_crop_box
+    ref_mask = mask[y1:y2, x1:x2]
     cv2.imwrite(ref_img, ref)
+    ref_mask_path = os.path.join(out_dir, 'ref_mask.png')
+    cv2.imwrite(ref_mask_path, ref_mask)
     
     optimal_scale, M, plane_model, field_of_view = estimate_pose(
         mesh,
         pcd_file,
         ref_img,
+        ref_mask_path,
         raw_img,
         ref_crop_box,
         out_dir,
