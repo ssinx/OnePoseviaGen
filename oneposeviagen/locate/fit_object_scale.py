@@ -8,6 +8,7 @@ import sys
 import json
 import torch
 from scipy.optimize import minimize
+from scipy.spatial import cKDTree
 from PIL import Image
 os.environ["PYOPENGL_PLATFORM"] = "egl"
 sys.path.append(os.getcwd())
@@ -324,6 +325,42 @@ def get_matched_sift_points(render_image, reference_image, render_mask=None, ref
     )
 
 
+def get_matched_contour_points(render_mask, reference_mask, max_points=256):
+    render_contours, _ = cv2.findContours(render_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    reference_contours, _ = cv2.findContours(reference_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not render_contours or not reference_contours:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    render_contour = max(render_contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+    reference_contour = max(reference_contours, key=cv2.contourArea).reshape(-1, 2).astype(np.float32)
+    if len(render_contour) < 4 or len(reference_contour) < 4:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    render_x, render_y, render_width, render_height = cv2.boundingRect(render_contour.astype(np.int32))
+    reference_x, reference_y, reference_width, reference_height = cv2.boundingRect(reference_contour.astype(np.int32))
+    if render_width <= 0 or render_height <= 0 or reference_width <= 0 or reference_height <= 0:
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+
+    sample_count = min(max_points, len(render_contour))
+    sample_indices = np.linspace(0, len(render_contour) - 1, sample_count, dtype=np.int32)
+    sampled_render_points = render_contour[sample_indices]
+    render_center = np.array([render_x + render_width / 2, render_y + render_height / 2], dtype=np.float32)
+    reference_center = np.array(
+        [reference_x + reference_width / 2, reference_y + reference_height / 2], dtype=np.float32
+    )
+    transformed_render_points = (
+        (sampled_render_points - render_center)
+        * np.array([reference_width / render_width, reference_height / render_height], dtype=np.float32)
+        + reference_center
+    )
+    distances, reference_indices = cKDTree(reference_contour).query(transformed_render_points)
+    max_distance = max(2.0, 0.03 * np.hypot(reference_width, reference_height))
+    valid = distances <= max_distance
+    if not np.any(valid):
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 2), dtype=np.float32)
+    return sampled_render_points[valid], reference_contour[reference_indices[valid]]
+
+
 def get_valid_render_matches(render_points, reference_points, depth, camera_intrinsics, camera_pose,
                              ref_crop_box, ref_image_shape, reference_mask=None):
     world_points, valid_mask = project_2d_to_3d(render_points, depth, camera_intrinsics, camera_pose)
@@ -452,6 +489,8 @@ def estimate_pose(mesh_file, pcd_file, ref_img, ref_mask, raw_img, ref_crop_box,
     )
     candidates = []
     matching_stats = []
+    reference_standard_deviation = float(ref_img.std())
+    reference_mask_area = int(np.count_nonzero(ref_mask))
     for pose_index, match_result in enumerate(match_results):
         candidate_pose = camera_poses[pose_index].cpu().numpy()
         superglue_render_points, superglue_reference_points = get_matched_superglue_points(match_result)
@@ -463,6 +502,15 @@ def estimate_pose(mesh_file, pcd_file, ref_img, ref_mask, raw_img, ref_crop_box,
         )
         render_points = np.concatenate([superglue_render_points, sift_render_points], axis=0)
         reference_points = np.concatenate([superglue_reference_points, sift_reference_points], axis=0)
+        contour_render_points = np.empty((0, 2), dtype=np.float32)
+        contour_reference_points = np.empty((0, 2), dtype=np.float32)
+        if len(render_points) < 4:
+            contour_render_points, contour_reference_points = get_matched_contour_points(
+                (depths[pose_index] > 0).astype(np.uint8) * 255,
+                ref_mask,
+            )
+            render_points = np.concatenate([render_points, contour_render_points], axis=0)
+            reference_points = np.concatenate([reference_points, contour_reference_points], axis=0)
         world_points, raw_points, valid_render_points = get_valid_render_matches(
             render_points,
             reference_points,
@@ -506,6 +554,7 @@ def estimate_pose(mesh_file, pcd_file, ref_img, ref_mask, raw_img, ref_crop_box,
             "superglue_reference_keypoint_count": int(len(match_result['keypoints1'])),
             "superglue_match_count": int(len(superglue_render_points)),
             "sift_match_count": int(len(sift_render_points)),
+            "contour_match_count": int(len(contour_render_points)),
             "valid_3d_match_count": int(len(world_points)),
             "pnp_inlier_count": int(inlier_count),
             "pnp_success": bool(pnp_success and inlier_count >= 4),
@@ -514,10 +563,25 @@ def estimate_pose(mesh_file, pcd_file, ref_img, ref_mask, raw_img, ref_crop_box,
     pnp_candidates = [candidate for candidate in candidates if candidate["pnp_success"]]
     if not pnp_candidates:
         best_candidate = max(candidates, key=lambda candidate: len(candidate["world_points"]))
+        best_pose = best_candidate["pose_index"]
+        plt.imsave(os.path.join(out_dir, 'best_pose_rendering.png'), colors[best_pose])
+        plot_image_with_points(
+            depths[best_pose],
+            best_candidate["render_points"],
+            os.path.join(out_dir, 'points_on_2D.png'),
+        )
+        plot_image_with_points(
+            raw_img,
+            best_candidate["raw_points"],
+            os.path.join(out_dir, 'points_original.png'),
+        )
         with open(matching_stats_path, 'w') as file:
             json.dump({
                 "selected_pose_index": best_candidate["pose_index"],
                 "selected_valid_3d_match_count": int(len(best_candidate["world_points"])),
+                "reference_image_shape": list(ref_img.shape),
+                "reference_gray_standard_deviation": reference_standard_deviation,
+                "reference_mask_area": reference_mask_area,
                 "pnp_status": "failed_no_valid_candidate",
                 "candidates": matching_stats,
             }, file, indent=2)
@@ -549,6 +613,9 @@ def estimate_pose(mesh_file, pcd_file, ref_img, ref_mask, raw_img, ref_crop_box,
     matching_diagnostics = {
         "selected_pose_index": best_pose,
         "selected_valid_3d_match_count": int(len(world_points)),
+        "reference_image_shape": list(ref_img.shape),
+        "reference_gray_standard_deviation": reference_standard_deviation,
+        "reference_mask_area": reference_mask_area,
         "pnp_status": "success",
         "pnp_inlier_count": int(len(inliers)),
         "candidates": matching_stats,
